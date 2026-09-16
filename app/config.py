@@ -150,6 +150,7 @@ class Settings:
     low_memory_mode: bool = _env_bool("LOW_MEMORY_MODE", True)
     db_cache_kib: int = int(os.getenv("DB_CACHE_KIB", "1024"))
     max_pending_searches: int = int(os.getenv("MAX_PENDING_SEARCHES", "30"))
+    vision_cache_ttl_days: int = int(os.getenv("VISION_CACHE_TTL_DAYS", "30"))
 
     # Confidence gates. The model's confidence is a heuristic, not a statistical guarantee.
     anikot_min_confidence: float = float(os.getenv("ANIKOT_MIN_CONFIDENCE", "0.55"))
@@ -200,6 +201,8 @@ class Settings:
             raise RuntimeError("DB_CACHE_KIB должен быть >= 256")
         if self.max_pending_searches < self.aiai_max_concurrency:
             raise RuntimeError("MAX_PENDING_SEARCHES должен быть >= AIAI_MAX_CONCURRENCY")
+        if self.vision_cache_ttl_days < 1:
+            raise RuntimeError("VISION_CACHE_TTL_DAYS должен быть >= 1")
         for name, value in (
             ("ANIKOT_MIN_CONFIDENCE", self.anikot_min_confidence),
             ("PRO_MIN_CONFIDENCE", self.pro_min_confidence),
