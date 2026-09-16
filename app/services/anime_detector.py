@@ -66,13 +66,25 @@ class AnimeDetector:
         return "Япония"
 
     def _from_remote(self, remote: dict[str, Any]) -> AnimeResult | None:
-        title = str(remote.get("title") or "").strip()
+        # Prefer Russian-facing fields. Old cache/provider responses remain compatible via fallbacks.
+        title = str(
+            remote.get("title_ru")
+            or remote.get("title")
+            or remote.get("title_original")
+            or ""
+        ).strip()
         if not title:
             return None
-        character_raw = remote.get("character")
+
+        character_raw = (
+            remote.get("character_ru")
+            or remote.get("character")
+            or remote.get("character_original")
+        )
         if not character_raw and isinstance(remote.get("characters"), list):
             character_raw = ", ".join(str(x) for x in remote["characters"][:2])
         character = str(character_raw or "Неизвестно").strip() or "Неизвестно"
+
         alternatives: list[dict[str, Any]] = []
         raw_alternatives = remote.get("alternatives")
         if isinstance(raw_alternatives, list):
@@ -80,7 +92,12 @@ class AnimeDetector:
             for item in raw_alternatives[:2]:
                 if not isinstance(item, dict):
                     continue
-                alt_title = str(item.get("title") or "").strip()
+                alt_title = str(
+                    item.get("title_ru")
+                    or item.get("title")
+                    or item.get("title_original")
+                    or ""
+                ).strip()
                 if not alt_title or alt_title.casefold() in seen:
                     continue
                 seen.add(alt_title.casefold())

@@ -177,7 +177,7 @@ async def _vision_cache_key(path: Path, mode: str, settings: Settings) -> str:
         "pro": settings.aiai_pro_model,
         "proplus": settings.aiai_proplus_model,
     }.get(mode, mode)
-    return f"{model}:{digest.hexdigest()}"
+    return f"ru-accuracy-v2:{model}:{digest.hexdigest()}"
 
 
 def extract_photo_url(message: Message, max_side: int) -> str | None:
