@@ -113,6 +113,11 @@ class Settings:
 
     unsubscribe_strike_limit: int = int(os.getenv("UNSUBSCRIBE_STRIKE_LIMIT", "3"))
 
+    # Abuse protection for non-anime image submissions.
+    non_anime_warning_limit: int = int(os.getenv("NON_ANIME_WARNING_LIMIT", "5"))
+    non_anime_block_days: int = int(os.getenv("NON_ANIME_BLOCK_DAYS", "7"))
+    non_anime_max_likelihood: float = float(os.getenv("NON_ANIME_MAX_LIKELIHOOD", "0.30"))
+
     # Community activity rewards regular AniKot requests.
     activity_actions_per_reward: int = int(os.getenv("ACTIVITY_ACTIONS_PER_REWARD", "3"))
     activity_reward_requests: int = int(os.getenv("ACTIVITY_REWARD_REQUESTS", "1"))
@@ -177,6 +182,12 @@ class Settings:
             raise RuntimeError("Не заполнены обязательные переменные: " + ", ".join(missing))
         if self.unsubscribe_strike_limit < 1:
             raise RuntimeError("UNSUBSCRIBE_STRIKE_LIMIT должен быть >= 1")
+        if self.non_anime_warning_limit < 1:
+            raise RuntimeError("NON_ANIME_WARNING_LIMIT должен быть >= 1")
+        if self.non_anime_block_days < 1:
+            raise RuntimeError("NON_ANIME_BLOCK_DAYS должен быть >= 1")
+        if not 0.0 <= self.non_anime_max_likelihood <= 1.0:
+            raise RuntimeError("NON_ANIME_MAX_LIKELIHOOD должен быть от 0 до 1")
         if self.referral_freeze_days < 1:
             raise RuntimeError("REFERRAL_FREEZE_DAYS должен быть >= 1")
         if self.vk_image_max_side < 320:
