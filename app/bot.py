@@ -262,7 +262,8 @@ def _shop_category_text(balance_type: str) -> str:
 
 
 def _package_button_label(package) -> str:
-    return package.label.replace(" запросов", "")
+    icon = {"anikot": "🔎", "pro": "✨", "proplus": "💎"}.get(package.balance_type, "🎟️")
+    return f"{icon} {package.label.replace(' запросов', '')}"
 
 
 def _threshold(settings: Settings, mode: str) -> float:
@@ -379,18 +380,18 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                     await db.set_referral_candidate(message.from_id, None)
                     await answer(message, "Ссылка не подошла.", keyboard=referral_choice_keyboard(False))
                 return True
-            if text == "Да, есть ссылка":
+            if text in {"Да, есть ссылка", "🔗 Да, есть ссылка"}:
                 await db.set_onboarding_state(message.from_id, "referral_link")
                 await answer(message, "Отправьте реферальную ссылку одним сообщением.", keyboard=referral_input_keyboard())
                 return True
-            if text in {"Нет, продолжить", "Продолжить без ссылки"}:
+            if text in {"Нет, продолжить", "➡️ Нет, продолжить", "Продолжить без ссылки", "➡️ Продолжить без ссылки"}:
                 await finish_registration(message)
                 return True
             await send_referral_question(message, user)
             return True
 
         if state == "referral_link":
-            if text == "Продолжить без ссылки":
+            if text in {"Продолжить без ссылки", "➡️ Продолжить без ссылки"}:
                 await finish_registration(message)
                 return True
             token = _parse_referral_token(text)
@@ -655,7 +656,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             return
 
         # Search cancellation is processed before any navigation.
-        if text == "Отмена":
+        if text in {"Отмена", "🛑 Отмена"}:
             task = search_tasks.get(message.from_id)
             if task and not task.done():
                 task.cancel()
@@ -667,20 +668,24 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             return
 
         # Home navigation.
-        if lower in {"start", "/start", "начать", "меню", "назад"}:
+        if lower in {"start", "/start", "начать", "меню", "назад", "◀️ назад"}:
             await send_home(message)
             return
 
-        if text == "Режим поиска":
+        if text in {"Режим поиска", "⚙️ Режим поиска"}:
             current = (await db.get_user(message.from_id) or {}).get("search_mode") or "anikot"
             current_name = {"anikot": "Обычный", "pro": "Pro", "proplus": "Pro+"}.get(current, "Обычный")
             await answer(message, f"Режим поиска AniKot\n\nТекущий режим: {current_name}", keyboard=search_mode_keyboard())
             return
 
-        if text in {"Обычный", "Pro", "Pro+"}:
-            mode = {"Обычный": "anikot", "Pro": "pro", "Pro+": "proplus"}[text]
+        if text in {"Обычный", "Pro", "Pro+", "🔎 Обычный", "✨ Pro", "💎 Pro+"}:
+            mode = {
+                "Обычный": "anikot", "🔎 Обычный": "anikot",
+                "Pro": "pro", "✨ Pro": "pro",
+                "Pro+": "proplus", "💎 Pro+": "proplus",
+            }[text]
             await db.set_search_mode(message.from_id, mode)
-            await send_home(message, f"✅ Режим поиска: {text}")
+            await send_home(message, f"✅ Режим поиска: { {'anikot': '🔎 Обычный', 'pro': '✨ Pro', 'proplus': '💎 Pro+'}[mode] }")
             return
 
         if text == "✅ Мне есть 18 лет":
@@ -689,7 +694,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             await answer(message, "✅ Возраст подтверждён. Отправьте запрос ещё раз.", keyboard=result_keyboard())
             return
 
-        if text == "Профиль":
+        if text in {"Профиль", "👤 Профиль"}:
             user = await db.get_user(message.from_id) or user
             unlimited = is_admin(message.from_id)
             normal_balance = "∞" if unlimited else user["requests_balance"]
@@ -707,7 +712,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             )
             return
 
-        if text == "Рефералы":
+        if text in {"Рефералы", "👥 Рефералы"}:
             stats = await db.referral_stats(message.from_id)
             link = _referral_link(settings, stats["token"])
             earned = stats["credited"] * settings.referral_reward_pro
@@ -723,7 +728,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             )
             return
 
-        if text == "Бонус за подписку":
+        if text in {"Бонус за подписку", "🎁 Бонус за подписку"}:
             user = await db.get_user(message.from_id) or user
             if user.get("subscription_bonus_claimed"):
                 await send_home(message)
@@ -737,7 +742,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             )
             return
 
-        if text == "Проверить подписку" or lower == "проверить подписку":
+        if text in {"Проверить подписку", "✅ Проверить подписку"} or lower == "проверить подписку":
             try:
                 member = await is_member(message.from_id)
             except Exception:
@@ -758,7 +763,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             return
 
         # Shop root and categories.
-        if text == "Купить запросы":
+        if text in {"Купить запросы", "🛒 Купить запросы"}:
             shop_views[message.from_id] = "root"
             await answer(message, _shop_root_text(), keyboard=shop_categories_keyboard())
             return
@@ -769,7 +774,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             await answer(message, _shop_category_text(balance_type), keyboard=shop_packages_keyboard(balance_type))
             return
 
-        if text == "◀ Назад":
+        if text in {"◀ Назад", "◀️ Назад"}:
             state = shop_views.get(message.from_id)
             if state and state != "root":
                 shop_views[message.from_id] = "root"
@@ -779,13 +784,14 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                 await send_home(message)
             return
 
-        if text == "◀ В магазин":
+        if text in {"◀ В магазин", "🛒 В магазин"}:
             shop_views[message.from_id] = "root"
             await answer(message, _shop_root_text(), keyboard=shop_categories_keyboard())
             return
 
         for key, package in PACKAGES.items():
-            if text == _package_button_label(package):
+            legacy_package_label = package.label.replace(" запросов", "")
+            if text in {_package_button_label(package), legacy_package_label}:
                 if not settings.public_base_url:
                     await answer(message, "Оплата временно недоступна. Попробуйте позже.", keyboard=await user_main_keyboard(message.from_id))
                     return

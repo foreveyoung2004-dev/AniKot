@@ -131,12 +131,12 @@ class Settings:
 
     proplus_require_age_confirmation: bool = _env_bool("PROPLUS_REQUIRE_AGE_CONFIRMATION", True)
 
-    # Three distinct search tiers through AIAI.BY. IDs are the provider's current model IDs.
+    # Three GPT vision search tiers through AIAI.BY.
     aiai_api_key: str = os.getenv("AIAI_API_KEY", "")
     aiai_base_url: str = os.getenv("AIAI_BASE_URL", "https://api.aiai.by/v1")
-    aiai_anikot_model: str = os.getenv("AIAI_ANIKOT_MODEL", "gemini-3.1-flash-lite")
-    aiai_pro_model: str = os.getenv("AIAI_PRO_MODEL", "gemini-3.5-flash")
-    aiai_proplus_model: str = os.getenv("AIAI_PROPLUS_MODEL", "gemini-3.1-pro")
+    aiai_anikot_model: str = os.getenv("AIAI_ANIKOT_MODEL", "gpt-5.4-nano")
+    aiai_pro_model: str = os.getenv("AIAI_PRO_MODEL", "gpt-5.4-mini")
+    aiai_proplus_model: str = os.getenv("AIAI_PROPLUS_MODEL", "gpt-5.5")
     aiai_timeout: float = float(os.getenv("AIAI_TIMEOUT", "90"))
     # Global cap for all AI tiers together. Values above 3 are clamped in low-memory 2.0.
     aiai_max_concurrency: int = max(1, min(int(os.getenv("AIAI_MAX_CONCURRENCY", "3")), 3))
