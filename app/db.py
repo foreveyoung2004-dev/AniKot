@@ -163,6 +163,12 @@ class Database:
                     FOREIGN KEY(vk_id) REFERENCES users(vk_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS vision_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS checkout_sessions (
                     token TEXT PRIMARY KEY,
                     vk_id INTEGER NOT NULL,
@@ -732,6 +738,42 @@ class Database:
                 updated = await (await db.execute("SELECT requests_balance FROM users WHERE vk_id=?", (vk_id,))).fetchone()
                 await db.commit()
                 return reward, int(updated["requests_balance"])
+
+    async def get_vision_cache(self, cache_key: str) -> dict[str, Any] | None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.settings.vision_cache_ttl_days)
+        async with self.connection() as db:
+            row = await (await db.execute(
+                "SELECT result_json, created_at FROM vision_cache WHERE cache_key=?",
+                (cache_key,),
+            )).fetchone()
+            if not row:
+                return None
+            try:
+                created = datetime.fromisoformat(str(row["created_at"]))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+            except ValueError:
+                created = datetime.min.replace(tzinfo=timezone.utc)
+            if created < cutoff:
+                await db.execute("DELETE FROM vision_cache WHERE cache_key=?", (cache_key,))
+                await db.commit()
+                return None
+            try:
+                value = json.loads(str(row["result_json"]))
+                return value if isinstance(value, dict) else None
+            except json.JSONDecodeError:
+                return None
+
+    async def put_vision_cache(self, cache_key: str, result: dict[str, Any]) -> None:
+        payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        async with self.connection() as db:
+            await db.execute(
+                """INSERT INTO vision_cache(cache_key,result_json,created_at)
+                VALUES (?,?,?)
+                ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json, created_at=excluded.created_at""",
+                (cache_key, payload, utc_now_iso()),
+            )
+            await db.commit()
 
     async def log_search(
         self,
