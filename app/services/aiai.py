@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import mimetypes
 import re
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Any
 
 import aiofiles
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class AIAIClient:
@@ -35,6 +38,7 @@ class AIAIClient:
         self._resolved_model: str | None = None
         self._model_lock = asyncio.Lock()
         self._semaphore = semaphore
+        self._structured_output_supported: bool | None = None
 
     @property
     def enabled(self) -> bool:
@@ -80,6 +84,9 @@ class AIAIClient:
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
         text = (text or "").strip()
+        if not text:
+            return {"raw": ""}
+
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
         text = re.sub(r"\s*```$", "", text)
         try:
@@ -87,44 +94,126 @@ class AIAIClient:
             return value if isinstance(value, dict) else {"raw": value}
         except json.JSONDecodeError:
             match = re.search(r"\{.*\}", text, flags=re.S)
-            if not match:
-                return {"raw": text}
-            value = json.loads(match.group(0))
-            return value if isinstance(value, dict) else {"raw": value}
+            if match:
+                try:
+                    value = json.loads(match.group(0))
+                    if isinstance(value, dict):
+                        return value
+                except json.JSONDecodeError:
+                    pass
 
-    async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 420) -> dict[str, Any]:
+        # Safe fallback for providers/models that ignore JSON-only instructions.
+        # We only extract an explicitly written title instead of guessing.
+        title_match = re.search(
+            r"(?:^|\n)\s*(?:название|title|anime)\s*[:\-]\s*[\"']?([^\n\"']{2,120})",
+            text,
+            flags=re.I,
+        )
+        if title_match:
+            title = title_match.group(1).strip(" .,:;-")
+            confidence_match = re.search(
+                r"(?:уверенность|confidence)\s*[:\-]\s*(\d+(?:\.\d+)?)\s*%?",
+                text,
+                flags=re.I,
+            )
+            confidence: float | None = None
+            if confidence_match:
+                try:
+                    confidence = float(confidence_match.group(1))
+                    if confidence > 1:
+                        confidence /= 100.0
+                except ValueError:
+                    confidence = None
+            return {
+                "title": title,
+                "confidence": confidence if confidence is not None else 0.45,
+                "is_anime": True,
+                "anime_likelihood": 0.7,
+                "raw": text[:1200],
+            }
+        return {"raw": text[:1200]}
+
+    async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 1100) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("search_service_unavailable")
+
         model = await self._resolve_model()
-        payload = {
+        payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": 0.0,
+            # GPT-5 family can spend part of the completion budget on reasoning.
+            # 400 tokens was too small for some vision replies and could leave no visible JSON.
             "max_tokens": max_tokens,
         }
-        response = await self.client.post(
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=self.timeout,
-        )
+        if self._structured_output_supported is not False:
+            payload["response_format"] = {"type": "json_object"}
+            payload["reasoning_effort"] = "low"
+
+        async def send(body: dict[str, Any]) -> httpx.Response:
+            return await self.client.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=self.timeout,
+            )
+
+        response = await send(payload)
+
+        # Some proxy/model combinations may reject response_format/reasoning_effort.
+        # Retry once without those fields; a rejected 400 request is not a model result.
+        if response.status_code == 400 and "response_format" in payload:
+            logger.warning(
+                "Structured output rejected for model=%s; retrying compatibility mode",
+                model,
+            )
+            self._structured_output_supported = False
+            fallback = dict(payload)
+            fallback.pop("response_format", None)
+            fallback.pop("reasoning_effort", None)
+            response = await send(fallback)
+        elif response.is_success and "response_format" in payload:
+            self._structured_output_supported = True
+
         response.raise_for_status()
         data = response.json()
-        content = data["choices"][0]["message"]["content"]
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
         if isinstance(content, list):
             content = "".join(
                 str(block.get("text", "")) if isinstance(block, dict) else str(block)
                 for block in content
             )
-        result = self._parse_json(str(content))
-        result["_model"] = data.get("model") or model
+
+        parsed = self._parse_json(str(content))
+        parsed["_model"] = data.get("model") or model
         usage = data.get("usage")
         if isinstance(usage, dict):
-            result["_usage"] = usage
-        return result
+            parsed["_usage"] = usage
+
+        logger.info(
+            "AI result model=%s finish=%s title=%r confidence=%r is_anime=%r anime_likelihood=%r usage=%s",
+            parsed.get("_model"),
+            choice.get("finish_reason"),
+            parsed.get("title"),
+            parsed.get("confidence"),
+            parsed.get("is_anime"),
+            parsed.get("anime_likelihood"),
+            usage if isinstance(usage, dict) else None,
+        )
+        if not parsed.get("title"):
+            raw_preview = str(parsed.get("raw") or content or "")[:500].replace("\n", " ")
+            logger.warning(
+                "AI returned no title model=%s finish=%s content_len=%s preview=%r",
+                parsed.get("_model"),
+                choice.get("finish_reason"),
+                len(str(content or "")),
+                raw_preview,
+            )
+        return parsed
 
     @staticmethod
     def _result_contract() -> str:
@@ -160,8 +249,9 @@ class AIAIClient:
                 del raw
 
             prompt = (
-                "Определи аниме или дунхуа по кадру. Внутренне сравни до трёх кандидатов "
-                "по персонажу, рисовке, одежде, фону, символам и тексту. "
+                "Определи аниме или дунхуа по изображению. Если это скриншот соцсети, "
+                "анализируй именно аниме-кадр внутри интерфейса. Внутренне сравни до трёх кандидатов "
+                "по персонажу, рисовке, одежде, фону, символам, цветовой палитре и тексту. "
                 "Нужен конкретный тайтл/сезон, если это возможно. "
                 "Для country используй Япония или Китай. "
                 + self._result_contract()
@@ -172,19 +262,22 @@ class AIAIClient:
                         {
                             "role": "system",
                             "content": (
-                                "Ты специалист по идентификации аниме и дунхуа. "
-                                "Приоритет — точность. Не угадывай при недостатке данных."
+                                "Ты эксперт по визуальному распознаванию аниме и дунхуа. "
+                                "Определи наиболее вероятный тайтл по центральному кадру. "
+                                "Игнорируй интерфейс TikTok/VK/YouTube, водяные знаки, подписи и рамки. "
+                                "Не отказывайся от ответа только из-за неполного кадра: если это аниме, "
+                                "обязательно дай лучший вероятный вариант и отрази сомнение через confidence."
                             ),
                         },
                         {
                             "role": "user",
                             "content": [
                                 {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+                                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}", "detail": "high"}},
                             ],
                         },
                     ],
-                    max_tokens=420,
+                    max_tokens=1200,
                 )
             finally:
                 del encoded
@@ -208,5 +301,5 @@ class AIAIClient:
                     },
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=360,
+                max_tokens=800,
             )
