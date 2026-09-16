@@ -18,6 +18,7 @@ class AnimeResult:
     adult_content: bool = False
     minor_risk: bool = False
     usage: dict[str, Any] | None = None
+    alternatives: list[dict[str, Any]] | None = None
 
 
 class AnimeDetector:
@@ -70,6 +71,24 @@ class AnimeDetector:
         if not character_raw and isinstance(remote.get("characters"), list):
             character_raw = ", ".join(str(x) for x in remote["characters"][:2])
         character = str(character_raw or "Неизвестно").strip() or "Неизвестно"
+        alternatives: list[dict[str, Any]] = []
+        raw_alternatives = remote.get("alternatives")
+        if isinstance(raw_alternatives, list):
+            seen = {title.casefold()}
+            for item in raw_alternatives[:2]:
+                if not isinstance(item, dict):
+                    continue
+                alt_title = str(item.get("title") or "").strip()
+                if not alt_title or alt_title.casefold() in seen:
+                    continue
+                seen.add(alt_title.casefold())
+                alternatives.append(
+                    {
+                        "title": alt_title,
+                        "confidence": self._confidence(item.get("confidence")),
+                    }
+                )
+
         return AnimeResult(
             title=title,
             character=character,
@@ -81,6 +100,7 @@ class AnimeDetector:
             adult_content=bool(remote.get("adult_content", False)),
             minor_risk=bool(remote.get("minor_risk", False)),
             usage=remote.get("_usage") if isinstance(remote.get("_usage"), dict) else None,
+            alternatives=alternatives,
         )
 
     async def _image(self, client: AIAIClient, path: str) -> AnimeResult | None:

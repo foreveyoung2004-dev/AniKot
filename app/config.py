@@ -147,9 +147,9 @@ class Settings:
     max_pending_searches: int = int(os.getenv("MAX_PENDING_SEARCHES", "30"))
 
     # Confidence gates. The model's confidence is a heuristic, not a statistical guarantee.
-    anikot_min_confidence: float = float(os.getenv("ANIKOT_MIN_CONFIDENCE", "0.70"))
-    pro_min_confidence: float = float(os.getenv("PRO_MIN_CONFIDENCE", "0.80"))
-    proplus_min_confidence: float = float(os.getenv("PROPLUS_MIN_CONFIDENCE", "0.90"))
+    anikot_min_confidence: float = float(os.getenv("ANIKOT_MIN_CONFIDENCE", "0.55"))
+    pro_min_confidence: float = float(os.getenv("PRO_MIN_CONFIDENCE", "0.65"))
+    proplus_min_confidence: float = float(os.getenv("PROPLUS_MIN_CONFIDENCE", "0.75"))
 
     lava_api_key: str = os.getenv("LAVA_API_KEY", "")
     lava_webhook_key: str = os.getenv("LAVA_WEBHOOK_KEY", "")

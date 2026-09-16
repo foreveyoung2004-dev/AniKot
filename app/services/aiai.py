@@ -130,11 +130,17 @@ class AIAIClient:
     def _result_contract() -> str:
         return (
             'Верни ТОЛЬКО JSON: '
-            '{"title":"точное название","character":"имя персонажа или Неизвестно",'
+            '{"title":"наиболее вероятное точное название",'
+            '"character":"имя персонажа или Неизвестно",'
             '"country":"Япония или Китай","year":2024,"episodes":12,"confidence":0.0,'
+            '"alternatives":[{"title":"другой вероятный тайтл","confidence":0.0}],'
             '"adult_content":false,"minor_risk":false}. '
-            'confidence от 0 до 1. Если точного ответа нет — title пустой и confidence низкая. '
-            'year/episodes могут быть null. Не выдумывай данные.'
+            'confidence от 0 до 1. Даже если уверенность невысокая, обязательно верни '
+            'наиболее вероятный title, если на изображении действительно аниме/дунхуа. '
+            'Не оставляй title пустым только из-за сомнений. '
+            'В alternatives верни до 2 других правдоподобных вариантов, если они есть. '
+            'title можно оставить пустым только если это явно не аниме/дунхуа или визуальных данных недостаточно вообще. '
+            'year/episodes могут быть null. Не выдумывай факты: сомнение отражай через confidence.'
         )
 
     async def identify_anime_from_image(self, image_path: str) -> dict[str, Any]:

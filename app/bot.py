@@ -99,6 +99,33 @@ def _decorate_text(text: str) -> str:
     return f"🐾 {value}"
 
 
+def format_uncertain_result(result: AnimeResult) -> str:
+    confidence = "Неизвестно"
+    if result.confidence is not None:
+        confidence = f"{max(0.0, min(1.0, result.confidence)) * 100:.0f}%"
+
+    lines = [
+        "🤔 Точного совпадения пока нет, но наиболее вероятный вариант:",
+        "",
+        f"🎬 Название: {result.title}",
+        f"👤 Персонаж: {result.character or 'Неизвестно'}",
+        f"🌍 Страна: {result.country}",
+        f"📅 Год: {result.year if result.year is not None else 'Неизвестно'}",
+        f"📺 Эпизоды: {result.episodes if result.episodes is not None else 'Неизвестно'}",
+        f"🎯 Уверенность: {confidence}",
+    ]
+
+    if result.alternatives:
+        lines.extend(["", "🔀 Другие возможные варианты:"])
+        for alt in result.alternatives[:2]:
+            alt_conf = alt.get("confidence")
+            conf_text = f"{alt_conf * 100:.0f}%" if isinstance(alt_conf, (int, float)) else "?"
+            lines.append(f"• {alt.get('title', 'Неизвестно')} — {conf_text}")
+
+    lines.extend(["", "💸 Запрос возвращён на баланс."])
+    return "\n".join(lines)
+
+
 def _field(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
@@ -450,16 +477,34 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
 
             if not _reliable(found, _threshold(settings, mode)):
                 await refund_search(vk_id, balance_type, refund_ref)
-                await db.log_search(vk_id, kind, mode, logged_query, found.engine if found else None, False, "low_confidence")
-                next_hint = {
-                    "anikot": " Попробуйте Pro.",
-                    "pro": " Попробуйте Pro+.",
-                    "proplus": "",
-                }[mode]
-                await answer(message, 
-                    "Не удалось определить аниме с достаточной уверенностью. Запрос возвращён." + next_hint,
-                    keyboard=result_keyboard(),
+                await db.log_search(
+                    vk_id,
+                    kind,
+                    mode,
+                    logged_query,
+                    found.engine if found else None,
+                    False,
+                    {
+                        "reason": "low_confidence",
+                        "title": found.title if found else None,
+                        "confidence": found.confidence if found else None,
+                        "alternatives": found.alternatives if found else [],
+                    },
                 )
+                if found and found.title:
+                    await answer(message, format_uncertain_result(found), keyboard=result_keyboard())
+                else:
+                    next_hint = {
+                        "anikot": " ✨ Попробуйте режим Pro.",
+                        "pro": " 💎 Попробуйте режим Pro+.",
+                        "proplus": "",
+                    }[mode]
+                    await answer(
+                        message,
+                        "😿 AniKot не смог выделить даже вероятный тайтл по этому кадру. "
+                        "💸 Запрос возвращён на баланс." + next_hint,
+                        keyboard=result_keyboard(),
+                    )
                 return
 
             await db.log_search(
@@ -473,6 +518,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                     "title": found.title,
                     "confidence": found.confidence,
                     "usage": found.usage or {},
+                    "alternatives": found.alternatives or [],
                 },
             )
             await answer(message, format_result(found), keyboard=result_keyboard())
