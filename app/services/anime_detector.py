@@ -19,6 +19,8 @@ class AnimeResult:
     minor_risk: bool = False
     usage: dict[str, Any] | None = None
     alternatives: list[dict[str, Any]] | None = None
+    is_anime: bool = True
+    anime_likelihood: float | None = None
 
 
 class AnimeDetector:
@@ -101,6 +103,8 @@ class AnimeDetector:
             minor_risk=bool(remote.get("minor_risk", False)),
             usage=remote.get("_usage") if isinstance(remote.get("_usage"), dict) else None,
             alternatives=alternatives,
+            is_anime=bool(remote.get("is_anime", True)),
+            anime_likelihood=self._confidence(remote.get("anime_likelihood")),
         )
 
     async def _image(self, client: AIAIClient, path: str) -> AnimeResult | None:
