@@ -665,12 +665,16 @@ class Database:
             if reset_strikes:
                 await db.execute(
                     """UPDATE users SET account_blocked=0, blocked_reason=NULL,
-                    unsubscribe_strikes=0, updated_at=? WHERE vk_id=?""",
+                    unsubscribe_strikes=0, non_anime_warnings=0,
+                    temporary_block_until=NULL, temporary_block_reason=NULL,
+                    updated_at=? WHERE vk_id=?""",
                     (utc_now_iso(), vk_id),
                 )
             else:
                 await db.execute(
-                    "UPDATE users SET account_blocked=0, blocked_reason=NULL, updated_at=? WHERE vk_id=?",
+                    """UPDATE users SET account_blocked=0, blocked_reason=NULL,
+                    temporary_block_until=NULL, temporary_block_reason=NULL,
+                    updated_at=? WHERE vk_id=?""",
                     (utc_now_iso(), vk_id),
                 )
             await db.commit()
