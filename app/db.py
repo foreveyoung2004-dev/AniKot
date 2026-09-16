@@ -331,26 +331,18 @@ class Database:
                     raise RuntimeError("legal acceptance missing")
 
                 now = utc_now_iso()
+                bonus = self.settings.registration_bonus_requests
                 await db.execute(
-                    """UPDATE users SET requests_balance=requests_balance+?, pro_balance=pro_balance+?,
-                    proplus_balance=proplus_balance+?, registration_completed_at=?, onboarding_state='complete',
+                    """UPDATE users SET requests_balance=requests_balance+?,
+                    registration_completed_at=?, onboarding_state='complete',
                     referral_candidate_token=NULL, updated_at=? WHERE vk_id=?""",
-                    (
-                        self.settings.initial_requests, self.settings.initial_pro_requests,
-                        self.settings.initial_proplus_requests, now, now, vk_id,
-                    ),
+                    (bonus, now, now, vk_id),
                 )
-                bonuses = [
-                    ("anikot", self.settings.initial_requests, "registration_bonus", f"normal:{vk_id}"),
-                    ("pro", self.settings.initial_pro_requests, "registration_pro_bonus", f"pro:{vk_id}"),
-                    ("proplus", self.settings.initial_proplus_requests, "registration_proplus_bonus", f"proplus:{vk_id}"),
-                ]
-                for btype, amount, reason, ref in bonuses:
-                    if amount:
-                        await db.execute(
-                            "INSERT OR IGNORE INTO ledger(vk_id,delta,balance_type,reason,ref,created_at) VALUES (?,?,?,?,?,?)",
-                            (vk_id, amount, btype, reason, ref, now),
-                        )
+                if bonus:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO ledger(vk_id,delta,balance_type,reason,ref,created_at) VALUES (?,?,'anikot','registration_bonus',?,?)",
+                        (vk_id, bonus, f"registration:{vk_id}", now),
+                    )
                 updated = await (await db.execute("SELECT * FROM users WHERE vk_id=?", (vk_id,))).fetchone()
                 await db.commit()
                 return True, dict(updated)
@@ -526,7 +518,7 @@ class Database:
             async with self.connection() as db:
                 await db.execute("BEGIN IMMEDIATE")
                 row = await (await db.execute(
-                    "SELECT subscription_bonus_claimed, pro_balance, account_blocked FROM users WHERE vk_id=?",
+                    "SELECT subscription_bonus_claimed, requests_balance, account_blocked FROM users WHERE vk_id=?",
                     (vk_id,),
                 )).fetchone()
                 if not row or int(row["account_blocked"] or 0):
@@ -534,22 +526,23 @@ class Database:
                     return False, 0
                 if row["subscription_bonus_claimed"]:
                     await db.rollback()
-                    return False, int(row["pro_balance"])
+                    return False, int(row["requests_balance"])
                 now = utc_now_iso()
+                bonus = self.settings.subscription_bonus_requests
                 await db.execute(
                     """UPDATE users
                     SET subscription_bonus_claimed=1, subscription_revoked=0,
-                        pro_balance=pro_balance+?, updated_at=?
+                        requests_balance=requests_balance+?, updated_at=?
                     WHERE vk_id=?""",
-                    (self.settings.subscription_bonus_pro, now, vk_id),
+                    (bonus, now, vk_id),
                 )
                 await db.execute(
-                    "INSERT INTO ledger(vk_id,delta,balance_type,reason,ref,created_at) VALUES (?,?,'pro','subscription_bonus',?,?)",
-                    (vk_id, self.settings.subscription_bonus_pro, str(vk_id), now),
+                    "INSERT INTO ledger(vk_id,delta,balance_type,reason,ref,created_at) VALUES (?,?,'anikot','subscription_bonus',?,?)",
+                    (vk_id, bonus, str(vk_id), now),
                 )
-                updated = await (await db.execute("SELECT pro_balance FROM users WHERE vk_id=?", (vk_id,))).fetchone()
+                updated = await (await db.execute("SELECT requests_balance FROM users WHERE vk_id=?", (vk_id,))).fetchone()
                 await db.commit()
-                return True, int(updated["pro_balance"])
+                return True, int(updated["requests_balance"])
 
     async def register_unsubscribe_strike(self, vk_id: int, event_ref: str, details: str | None = None) -> dict[str, Any]:
         """Add one strike after a GROUP_LEAVE event.

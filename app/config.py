@@ -101,10 +101,9 @@ class Settings:
     admin_ids: set[int] = frozenset(_parse_admin_ids(os.getenv("ADMIN_IDS", "")))
 
     # Registration / bonuses.
-    initial_requests: int = int(os.getenv("INITIAL_REQUESTS", "0"))
-    initial_pro_requests: int = int(os.getenv("INITIAL_PRO_REQUESTS", "1"))
-    initial_proplus_requests: int = int(os.getenv("INITIAL_PROPLUS_REQUESTS", "0"))
-    subscription_bonus_pro: int = int(os.getenv("SUBSCRIPTION_BONUS_PRO", "5"))
+    # New users receive regular AniKot searches; referrals reward Pro searches.
+    registration_bonus_requests: int = int(os.getenv("REGISTRATION_BONUS_REQUESTS", "1"))
+    subscription_bonus_requests: int = int(os.getenv("SUBSCRIPTION_BONUS_REQUESTS", "2"))
     referral_reward_pro: int = int(os.getenv("REFERRAL_REWARD_PRO", "3"))
     referral_freeze_days: int = int(os.getenv("REFERRAL_FREEZE_DAYS", "3"))
 

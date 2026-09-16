@@ -262,7 +262,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         await db.complete_registration(message.from_id)
         await send_home(
             message,
-            f"✅ Регистрация завершена.\n🎁 Начислено: +{settings.initial_pro_requests} AniKot Pro за регистрацию.",
+            f"✅ Регистрация завершена.\n🎁 Начислено: +{settings.registration_bonus_requests} AniKot за регистрацию.",
         )
 
     async def handle_onboarding(message: Message, user: dict[str, Any], text: str) -> bool:
@@ -544,7 +544,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                 return
             group_line = settings.vk_group_url or f"https://vk.com/club{settings.vk_group_id}"
             await message.answer(
-                f"🎁 За подписку: +{settings.subscription_bonus_pro} AniKot Pro.\n\n"
+                f"🎁 За подписку: +{settings.subscription_bonus_requests} AniKot.\n\n"
                 f"После получения бонуса отписка даёт 1 страйк. "
                 f"{settings.unsubscribe_strike_limit} страйка — блокировка аккаунта.",
                 keyboard=subscription_keyboard(group_line),
@@ -567,7 +567,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             claimed, _balance = await db.claim_subscription_bonus(message.from_id)
             await send_home(
                 message,
-                f"✅ Начислено: +{settings.subscription_bonus_pro} AniKot Pro." if claimed else "Бонус уже был получен.",
+                f"✅ Начислено: +{settings.subscription_bonus_requests} AniKot." if claimed else "Бонус уже был получен.",
             )
             return
 
