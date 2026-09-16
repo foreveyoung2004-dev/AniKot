@@ -8,27 +8,33 @@ import re
 from pathlib import Path
 from typing import Any
 
+import aiofiles
 import httpx
 
 
 class AIAIClient:
-    """Small OpenAI-compatible client used by one AniKot search tier."""
+    """Memory-conscious OpenAI-compatible async client for one AniKot tier.
+
+    All tiers share one httpx.AsyncClient and one global semaphore supplied by main.py.
+    """
 
     def __init__(
         self,
         api_key: str,
         base_url: str,
         preferred_model: str,
+        client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore,
         timeout: float = 90,
-        max_concurrency: int = 6,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.preferred_model = preferred_model
         self.timeout = timeout
+        self.client = client
         self._resolved_model: str | None = None
         self._model_lock = asyncio.Lock()
-        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._semaphore = semaphore
 
     @property
     def enabled(self) -> bool:
@@ -38,20 +44,21 @@ class AIAIClient:
     def _norm(value: str) -> str:
         return re.sub(r"[^a-z0-9]+", "", value.lower())
 
-    async def _resolve_model(self, client: httpx.AsyncClient) -> str:
+    async def _resolve_model(self) -> str:
         if self._resolved_model:
             return self._resolved_model
         async with self._model_lock:
             if self._resolved_model:
                 return self._resolved_model
             try:
-                response = await client.get(
+                response = await self.client.get(
                     f"{self.base_url}/models",
                     headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=min(self.timeout, 30),
                 )
                 response.raise_for_status()
                 data = response.json().get("data", [])
-                ids = [str(x.get("id", "")) for x in data if x.get("id")]
+                ids = [str(x.get("id", "")) for x in data if isinstance(x, dict) and x.get("id")]
                 lower = {x.lower(): x for x in ids}
                 wanted = self.preferred_model.lower()
                 if wanted in lower:
@@ -67,8 +74,6 @@ class AIAIClient:
                     ]
                     self._resolved_model = matches[0] if matches else self.preferred_model
             except Exception:
-                # Use the configured ID directly. The actual request will fail cleanly
-                # and the caller will refund the user's search credit.
                 self._resolved_model = self.preferred_model
             return self._resolved_model
 
@@ -87,98 +92,97 @@ class AIAIClient:
             value = json.loads(match.group(0))
             return value if isinstance(value, dict) else {"raw": value}
 
-    async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 650) -> dict[str, Any]:
+    async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 420) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("search_service_unavailable")
         async with self._semaphore:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                model = await self._resolve_model(client)
-                payload = {
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.0,
-                    "max_tokens": max_tokens,
-                }
-                response = await client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
+            model = await self._resolve_model()
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": max_tokens,
+            }
+            response = await self.client.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(
+                    str(block.get("text", "")) if isinstance(block, dict) else str(block)
+                    for block in content
                 )
-                response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                if isinstance(content, list):
-                    # Some OpenAI-compatible providers return content blocks.
-                    content = "".join(
-                        str(block.get("text", "")) if isinstance(block, dict) else str(block)
-                        for block in content
-                    )
-                result = self._parse_json(str(content))
-                result["_model"] = data.get("model") or model
-                usage = data.get("usage")
-                if isinstance(usage, dict):
-                    result["_usage"] = usage
-                return result
+            result = self._parse_json(str(content))
+            result["_model"] = data.get("model") or model
+            usage = data.get("usage")
+            if isinstance(usage, dict):
+                result["_usage"] = usage
+            return result
 
     @staticmethod
     def _result_contract() -> str:
         return (
-            'Верни ТОЛЬКО JSON по схеме: '
-            '{"title":"точное название",'
-            '"character":"имя персонажа или Неизвестно",'
-            '"country":"Япония или Китай",'
-            '"year":2024,'
-            '"episodes":12,'
-            '"confidence":0.0,'
-            '"adult_content":false,'
-            '"minor_risk":false}. '
-            'confidence — число от 0 до 1. Если точного ответа нет, не угадывай: '
-            'оставь title пустым и поставь низкую confidence. '
-            'year и episodes могут быть null, если нельзя определить надёжно. '
-            'minor_risk=true только когда adult_content=true и есть признаки несовершеннолетнего '
-            'или возраст персонажа в сексуальном контексте неоднозначен.'
+            'Верни ТОЛЬКО JSON: '
+            '{"title":"точное название","character":"имя персонажа или Неизвестно",'
+            '"country":"Япония или Китай","year":2024,"episodes":12,"confidence":0.0,'
+            '"adult_content":false,"minor_risk":false}. '
+            'confidence от 0 до 1. Если точного ответа нет — title пустой и confidence низкая. '
+            'year/episodes могут быть null. Не выдумывай данные.'
         )
 
     async def identify_anime_from_image(self, image_path: str) -> dict[str, Any]:
         path = Path(image_path)
         mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        async with aiofiles.open(path, "rb") as fh:
+            raw = await fh.read()
+        try:
+            encoded = base64.b64encode(raw).decode("ascii")
+        finally:
+            del raw
+
         prompt = (
-            "Определи произведение по этому аниме/дунхуа-кадру. "
-            "Перед финальным ответом внутренне сравни до трёх наиболее вероятных кандидатов по персонажу, "
-            "дизайну, фону, рисовке, одежде, символам и тексту на кадре. "
-            "Нужен именно тайтл конкретного произведения/сезона, а не название франшизы, если это возможно. "
-            "Для country используй Япония для аниме и Китай для дунхуа. "
-            "Не описывай сексуальные действия и не давай ссылки на adult-контент. "
+            "Определи аниме или дунхуа по кадру. Внутренне сравни до трёх кандидатов "
+            "по персонажу, рисовке, одежде, фону, символам и тексту. "
+            "Нужен конкретный тайтл/сезон, если это возможно. "
+            "Для country используй Япония или Китай. "
             + self._result_contract()
         )
-        return await self._chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты профессиональный специалист по идентификации аниме и дунхуа. "
-                        "Приоритет — точность; не выдумывай сведения, когда не уверен."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-                    ],
-                },
-            ]
-        )
+        try:
+            return await self._chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты специалист по идентификации аниме и дунхуа. "
+                            "Приоритет — точность. Не угадывай при недостатке данных."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+                        ],
+                    },
+                ],
+                max_tokens=420,
+            )
+        finally:
+            del encoded
 
     async def identify_anime_from_text(self, query: str) -> dict[str, Any]:
         prompt = (
             f"Пользователь ищет аниме или дунхуа по названию/описанию: {query!r}. "
-            "Исправь опечатки, русскую транслитерацию и альтернативные названия, затем выбери наиболее вероятный тайтл. "
-            "Для country используй Япония или Китай. Не выдумывай сведения. "
+            "Исправь опечатки, транслитерацию и альтернативные названия. "
+            "Выбери наиболее вероятный тайтл, но не выдумывай сведения. "
             + self._result_contract()
         )
         return await self._chat(
@@ -186,11 +190,11 @@ class AIAIClient:
                 {
                     "role": "system",
                     "content": (
-                        "Ты профессиональный специалист по каталогам аниме и дунхуа. "
+                        "Ты специалист по каталогам аниме и дунхуа. "
                         "Возвращай только сведения, в которых достаточно уверен."
                     ),
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=550,
+            max_tokens=360,
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+from pathlib import Path
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Callable
 from urllib.parse import parse_qs
@@ -34,6 +35,17 @@ def _label(balance_type: str) -> str:
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _rss_mb() -> float | None:
+    """Current RSS on Linux without adding psutil to the runtime."""
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        return None
+    return None
 
 
 def _checkout_page(package_label: str, action_url: str, error: str = "") -> str:
@@ -72,16 +84,20 @@ def build_web_app(
 
     @app.get("/")
     async def root():
-        return {"ok": True, "service": "AniKot", "version": "1.6.1-bothost"}
+        return {"ok": True, "service": "AniKot", "version": "2.0.0-bothost"}
 
     @app.get("/health")
     async def health(request: Request):
+        bot = getattr(request.app.state, "bot", None)
+        active = len(getattr(bot, "_anikot_search_tasks", {})) if bot is not None else 0
         return {
             "ok": True,
             "bot": "AniKot",
-            "version": "1.6.1-bothost",
+            "version": "2.0.0-bothost",
             "runtime_ready": bool(getattr(request.app.state, "runtime_ready", False)),
             "ready": bool(getattr(request.app.state, "runtime_ready", False)),
+            "ram_mb": _rss_mb(),
+            "active_searches": active,
         }
 
     @app.get("/checkout/{token}", response_class=HTMLResponse)

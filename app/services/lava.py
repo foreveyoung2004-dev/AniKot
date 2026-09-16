@@ -52,8 +52,9 @@ def _format_details(data: Any) -> str:
 
 
 class LavaClient:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, client: httpx.AsyncClient):
         self.s = settings
+        self.client = client
         self._resolved_offer_id: str | None = None
 
     @property
@@ -61,54 +62,39 @@ class LavaClient:
         return bool(self.s.lava_api_key and (self.s.lava_offer_id or self.s.lava_product_title))
 
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        headers = {
-            "Accept": "application/json",
-            "X-Api-Key": self.s.lava_api_key,
-        }
+        headers = {"Accept": "application/json", "X-Api-Key": self.s.lava_api_key}
         if "json" in kwargs:
             headers["Content-Type"] = "application/json"
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
-            response = await client.request(
-                method,
-                f"{self.s.lava_base_url.rstrip('/')}{path}",
-                headers=headers,
-                **kwargs,
-            )
+        response = await self.client.request(
+            method,
+            f"{self.s.lava_base_url.rstrip('/')}{path}",
+            headers=headers,
+            timeout=40,
+            **kwargs,
+        )
         try:
             data: Any = response.json()
         except Exception:
             data = response.text[:2000]
         if response.status_code >= 400:
-            raise LavaAPIError(
-                response.status_code,
-                _format_details(data) or response.reason_phrase,
-                data,
-            )
+            raise LavaAPIError(response.status_code, _format_details(data) or response.reason_phrase, data)
         if not isinstance(data, dict):
             raise LavaAPIError(response.status_code, "invalid_response", data)
         return data
 
     async def _discover_offer_id(self) -> str | None:
-        """Resolve the current dynamic offer after a product was edited/republished.
-
-        This prevents stale offer IDs from permanently breaking checkout. If several
-        dynamic products exist, LAVA_PRODUCT_TITLE is used to select the AniKot one.
-        """
         data = await self._request_json("GET", "/api/v2/products?feedVisibility=ONLY_HIDDEN")
         items = data.get("items") or []
         if not isinstance(items, list):
             return None
-
         candidates: list[tuple[str, str]] = []
         configured = (self.s.lava_offer_id or "").strip()
         wanted_title = (self.s.lava_product_title or "").strip().casefold()
-
         for product in items:
             if not isinstance(product, dict) or not bool(product.get("isDynamicPrice")):
                 continue
             title = str(product.get("title") or "").strip()
-            offers = product.get("offers") or []
-            for offer in offers:
+            for offer in product.get("offers") or []:
                 if not isinstance(offer, dict) or not offer.get("id"):
                     continue
                 offer_id = str(offer["id"])
@@ -116,7 +102,6 @@ class LavaClient:
                     self._resolved_offer_id = offer_id
                     return offer_id
                 candidates.append((title, offer_id))
-
         if wanted_title:
             for title, offer_id in candidates:
                 if title.casefold() == wanted_title:
@@ -126,7 +111,6 @@ class LavaClient:
                 if wanted_title in title.casefold() or title.casefold() in wanted_title:
                     self._resolved_offer_id = offer_id
                     return offer_id
-
         if len(candidates) == 1:
             self._resolved_offer_id = candidates[0][1]
             return self._resolved_offer_id
@@ -138,7 +122,6 @@ class LavaClient:
         minimum = minimums.get(currency)
         if minimum is not None and package.price < minimum:
             raise LavaAPIError(400, "amount_below_minimum")
-
         amount: int | float = int(package.price) if float(package.price).is_integer() else float(package.price)
         body: dict[str, Any] = {
             "email": email.strip(),
@@ -157,25 +140,20 @@ class LavaClient:
     async def create_invoice(self, email: str, package: Package) -> tuple[str, str, dict[str, Any]]:
         if not self.enabled:
             raise LavaAPIError(None, "payments_unavailable")
-
         offer_id = self._resolved_offer_id or self.s.lava_offer_id.strip()
         if not offer_id:
             offer_id = await self._discover_offer_id() or ""
         if not offer_id:
             raise LavaAPIError(None, "product_unavailable")
-
         try:
             data = await self._create_with_offer(email, package, offer_id)
         except LavaAPIError as exc:
-            # A republished dynamic product may receive a new offers[].id. Refresh
-            # once on not-found and retry transparently for the buyer.
             if exc.status_code != 404:
                 raise
             refreshed = await self._discover_offer_id()
             if not refreshed or refreshed == offer_id:
                 raise
             data = await self._create_with_offer(email, package, refreshed)
-
         external_id = _deep_find(data, ("contractId", "contract_id", "invoiceId", "invoice_id", "id"))
         payment_url = _deep_find(
             data,

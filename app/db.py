@@ -43,6 +43,11 @@ class Database:
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA foreign_keys=ON")
         await conn.execute("PRAGMA busy_timeout=5000")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        await conn.execute("PRAGMA temp_store=FILE")
+        await conn.execute("PRAGMA mmap_size=0")
+        await conn.execute("PRAGMA journal_size_limit=4194304")
+        await conn.execute(f"PRAGMA cache_size=-{int(self.settings.db_cache_kib)}")
         try:
             yield conn
         finally:

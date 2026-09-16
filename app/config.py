@@ -63,7 +63,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _load_packages(currency: str) -> Dict[str, Package]:
-    # Product matrix agreed for AniKot v1.6.
+    # Product matrix for AniKot 2.0.
     default = {
         "A50": {"requests": 50, "price": 59, "balance_type": "anikot", "label": "50 запросов — 59 ₽"},
         "A150": {"requests": 150, "price": 129, "balance_type": "anikot", "label": "150 запросов — 129 ₽"},
@@ -133,7 +133,17 @@ class Settings:
     aiai_pro_model: str = os.getenv("AIAI_PRO_MODEL", "gemini-3.5-flash")
     aiai_proplus_model: str = os.getenv("AIAI_PROPLUS_MODEL", "gemini-3.1-pro")
     aiai_timeout: float = float(os.getenv("AIAI_TIMEOUT", "90"))
-    aiai_max_concurrency: int = int(os.getenv("AIAI_MAX_CONCURRENCY", "6"))
+    # Global cap for all AI tiers together. Values above 3 are clamped in low-memory 2.0.
+    aiai_max_concurrency: int = max(1, min(int(os.getenv("AIAI_MAX_CONCURRENCY", "3")), 3))
+
+    # Low-memory transport/image settings.
+    vk_image_max_side: int = int(os.getenv("VK_IMAGE_MAX_SIDE", "1280"))
+    image_max_bytes: int = int(os.getenv("IMAGE_MAX_BYTES", str(6 * 1024 * 1024)))
+    http_max_connections: int = int(os.getenv("HTTP_MAX_CONNECTIONS", "8"))
+    http_max_keepalive_connections: int = int(os.getenv("HTTP_MAX_KEEPALIVE_CONNECTIONS", "4"))
+    http_keepalive_expiry: float = float(os.getenv("HTTP_KEEPALIVE_EXPIRY", "20"))
+    low_memory_mode: bool = _env_bool("LOW_MEMORY_MODE", True)
+    db_cache_kib: int = int(os.getenv("DB_CACHE_KIB", "1024"))
 
     # Confidence gates. The model's confidence is a heuristic, not a statistical guarantee.
     anikot_min_confidence: float = float(os.getenv("ANIKOT_MIN_CONFIDENCE", "0.70"))
@@ -168,6 +178,14 @@ class Settings:
             raise RuntimeError("UNSUBSCRIBE_STRIKE_LIMIT должен быть >= 1")
         if self.referral_freeze_days < 1:
             raise RuntimeError("REFERRAL_FREEZE_DAYS должен быть >= 1")
+        if self.vk_image_max_side < 320:
+            raise RuntimeError("VK_IMAGE_MAX_SIDE должен быть >= 320")
+        if self.image_max_bytes < 262144:
+            raise RuntimeError("IMAGE_MAX_BYTES слишком мал")
+        if self.http_max_connections < 1 or self.http_max_keepalive_connections < 0:
+            raise RuntimeError("Некорректные HTTP лимиты")
+        if self.db_cache_kib < 256:
+            raise RuntimeError("DB_CACHE_KIB должен быть >= 256")
         for name, value in (
             ("ANIKOT_MIN_CONFIDENCE", self.anikot_min_confidence),
             ("PRO_MIN_CONFIDENCE", self.pro_min_confidence),

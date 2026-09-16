@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import time
 import uuid
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import aiofiles
 import httpx
 from vkbottle import GroupEventType
 from vkbottle.bot import Bot, Message
@@ -56,14 +59,44 @@ def format_result(result: AnimeResult) -> str:
         confidence = f"{max(0.0, min(1.0, result.confidence)) * 100:.0f}%"
     return "\n".join(
         [
-            f"Название: {result.title}",
-            f"Персонаж: {result.character or 'Неизвестно'}",
-            f"Страна: {result.country}",
-            f"Год: {result.year if result.year is not None else 'Неизвестно'}",
-            f"Количество эпизодов: {result.episodes if result.episodes is not None else 'Неизвестно'}",
-            f"Уверенность: {confidence}",
+            f"🎬 Название: {result.title}",
+            f"👤 Персонаж: {result.character or 'Неизвестно'}",
+            f"🌍 Страна: {result.country}",
+            f"📅 Год: {result.year if result.year is not None else 'Неизвестно'}",
+            f"📺 Количество эпизодов: {result.episodes if result.episodes is not None else 'Неизвестно'}",
+            f"🎯 Уверенность: {confidence}",
         ]
     )
+
+
+_EMOJI_PREFIXES = (
+    "🐾", "✅", "❌", "⚠️", "⛔", "🎁", "🔎", "🔍", "✨", "💎", "👤", "👥",
+    "🛒", "💳", "🎬", "📷", "📸", "🔗", "⚙️", "📊", "💰", "📢", "🛡️",
+)
+
+
+def _decorate_text(text: str) -> str:
+    value = str(text or "")
+    if value.startswith(_EMOJI_PREFIXES):
+        return value
+    lower = value.lower()
+    rules = (
+        (("режим", "настрой"), "⚙️"),
+        (("регистрац",), "✅"),
+        (("ссылк", "реферал"), "🔗"),
+        (("подпис", "групп"), "👥"),
+        (("бонус", "награ"), "🎁"),
+        (("оплат", "магаз"), "💳"),
+        (("поиск", "аниме", "кадр", "фото"), "🔎"),
+        (("профил", "аккаунт"), "👤"),
+        (("ошиб", "не удалось"), "⚠️"),
+        (("начис", "готов"), "✅"),
+        (("отправ",), "📷"),
+    )
+    for keys, emoji in rules:
+        if any(key in lower for key in keys):
+            return f"{emoji} {value}"
+    return f"🐾 {value}"
 
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:
@@ -72,7 +105,7 @@ def _field(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
-def _photo_url_from_attachments(attachments: Any) -> str | None:
+def _photo_url_from_attachments(attachments: Any, max_side: int) -> str | None:
     for attachment in attachments or []:
         atype = _field(attachment, "type")
         photo = _field(attachment, "photo")
@@ -80,47 +113,68 @@ def _photo_url_from_attachments(attachments: Any) -> str | None:
             photo = _field(attachment, "object")
         if photo is None:
             continue
-        best, best_area = None, -1
+
+        candidates: list[tuple[int, int, str]] = []
         for size in _field(photo, "sizes", []) or []:
             url = _field(size, "url")
             if not url:
                 continue
             width = int(_field(size, "width", 0) or 0)
             height = int(_field(size, "height", 0) or 0)
-            area = width * height
-            if area > best_area:
-                best, best_area = str(url), area
-        if best:
-            return best
+            candidates.append((width, height, str(url)))
+        if not candidates:
+            continue
+
+        fitting = [x for x in candidates if max(x[0], x[1]) <= max_side]
+        if fitting:
+            return max(fitting, key=lambda x: x[0] * x[1])[2]
+
+        return min(candidates, key=lambda x: max(x[0], x[1]) or 10**9)[2]
     return None
 
 
-def extract_photo_url(message: Message) -> str | None:
-    direct = _photo_url_from_attachments(getattr(message, "attachments", None))
+def extract_photo_url(message: Message, max_side: int) -> str | None:
+    direct = _photo_url_from_attachments(getattr(message, "attachments", None), max_side)
     if direct:
         return direct
     reply = getattr(message, "reply_message", None)
     if reply:
-        found = _photo_url_from_attachments(_field(reply, "attachments", []))
+        found = _photo_url_from_attachments(_field(reply, "attachments", []), max_side)
         if found:
             return found
     for forwarded in getattr(message, "fwd_messages", None) or []:
-        found = _photo_url_from_attachments(_field(forwarded, "attachments", []))
+        found = _photo_url_from_attachments(_field(forwarded, "attachments", []), max_side)
         if found:
             return found
     return None
 
 
-async def download_image(url: str, target_dir: str) -> Path:
+async def download_image(
+    url: str,
+    target_dir: str,
+    client: httpx.AsyncClient,
+    max_bytes: int,
+) -> Path:
+    """Stream a VK image to disk without buffering the whole response in RAM."""
     Path(target_dir).mkdir(parents=True, exist_ok=True)
     path = Path(target_dir) / f"{uuid.uuid4()}.jpg"
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        if len(response.content) > 15 * 1024 * 1024:
-            raise ValueError("image_too_large")
-        path.write_bytes(response.content)
-    return path
+    total = 0
+    try:
+        async with client.stream("GET", url, timeout=30) as response:
+            response.raise_for_status()
+            length = response.headers.get("content-length")
+            if length and int(length) > max_bytes:
+                raise ValueError("image_too_large")
+            async with aiofiles.open(path, "wb") as fh:
+                async for chunk in response.aiter_bytes(64 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError("image_too_large")
+                    await fh.write(chunk)
+        return path
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
 
 
 def _extract_ref_payload(message: Message) -> str | None:
@@ -194,11 +248,17 @@ def _reliable(result: AnimeResult | None, threshold: float) -> bool:
     return bool(result and result.confidence is not None and result.confidence >= threshold)
 
 
-def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: LavaClient) -> Bot:
+def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: LavaClient, http_client: httpx.AsyncClient) -> Bot:
     bot = Bot(settings.vk_token)
     search_tasks: dict[int, asyncio.Task] = {}
     search_context: dict[int, tuple[str, str]] = {}
     shop_views: dict[int, str] = {}
+    referral_check_lock = asyncio.Lock()
+    last_referral_check = 0.0
+    setattr(bot, "_anikot_search_tasks", search_tasks)
+
+    async def answer(message: Message, text: str, **kwargs: Any):
+        return await message.answer(_decorate_text(text), **kwargs)
 
     async def is_member(vk_id: int) -> bool:
         result = await bot.api.groups.is_member(group_id=settings.vk_group_id, user_id=vk_id)
@@ -213,7 +273,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         return main_keyboard(show_subscription_bonus=show_bonus)
 
     async def send_home(message: Message, text: str = "🐾 AniKot\n\nВыберите нужный раздел:") -> None:
-        await message.answer(text, keyboard=await user_main_keyboard(message.from_id))
+        await answer(message, text, keyboard=await user_main_keyboard(message.from_id))
 
     async def consume_search(vk_id: int, balance_type: str) -> int | str | None:
         if is_admin(vk_id):
@@ -226,6 +286,15 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         return await db.refund_search_request(vk_id, balance_type, ref)
 
     async def notify_mature_referrals() -> None:
+        nonlocal last_referral_check
+        now = time.monotonic()
+        if now - last_referral_check < 60 or referral_check_lock.locked():
+            return
+        async with referral_check_lock:
+            now = time.monotonic()
+            if now - last_referral_check < 60:
+                return
+            last_referral_check = now
         try:
             rewards = await db.release_mature_referrals()
             for reward in rewards:
@@ -244,7 +313,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
     async def send_legal(message: Message) -> None:
         agreement = _vk_text_link("Пользовательское соглашение", settings.user_agreement_url)
         privacy = _vk_text_link("Политику конфиденциальности", settings.privacy_policy_url)
-        await message.answer(
+        await answer(message, 
             f"Продолжая регистрацию, вы принимаете {agreement} и {privacy}.",
             keyboard=legal_keyboard(),
         )
@@ -256,7 +325,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             if has_candidate
             else "У вас есть реферальная ссылка?"
         )
-        await message.answer(text, keyboard=referral_choice_keyboard(has_candidate))
+        await answer(message, text, keyboard=referral_choice_keyboard(has_candidate))
 
     async def finish_registration(message: Message) -> None:
         await db.complete_registration(message.from_id)
@@ -284,11 +353,11 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                     await finish_registration(message)
                 else:
                     await db.set_referral_candidate(message.from_id, None)
-                    await message.answer("Ссылка не подошла.", keyboard=referral_choice_keyboard(False))
+                    await answer(message, "Ссылка не подошла.", keyboard=referral_choice_keyboard(False))
                 return True
             if text == "Да, есть ссылка":
                 await db.set_onboarding_state(message.from_id, "referral_link")
-                await message.answer("Отправьте реферальную ссылку одним сообщением.", keyboard=referral_input_keyboard())
+                await answer(message, "Отправьте реферальную ссылку одним сообщением.", keyboard=referral_input_keyboard())
                 return True
             if text in {"Нет, продолжить", "Продолжить без ссылки"}:
                 await finish_registration(message)
@@ -302,11 +371,11 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                 return True
             token = _parse_referral_token(text)
             if not token:
-                await message.answer("Не удалось распознать ссылку.", keyboard=referral_input_keyboard())
+                await answer(message, "Не удалось распознать ссылку.", keyboard=referral_input_keyboard())
                 return True
             ok, _ = await db.apply_referral_token(message.from_id, token)
             if not ok:
-                await message.answer("Эта ссылка не подошла.", keyboard=referral_input_keyboard())
+                await answer(message, "Эта ссылка не подошла.", keyboard=referral_input_keyboard())
                 return True
             await finish_registration(message)
             return True
@@ -318,12 +387,12 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         await db.set_search_mode(message.from_id, "proplus")
         user = await db.get_user(message.from_id)
         if settings.proplus_require_age_confirmation and not (user or {}).get("age_confirmed_at"):
-            await message.answer(
+            await answer(message, 
                 "Для этого запроса требуетсся AniKot Pro+ и подтверждения возраста 18+.",
                 keyboard=age_confirmation_keyboard(),
             )
             return
-        await message.answer(
+        await answer(message, 
             "Для этого запроса требуется AniKot Pro+. Отправьте запрос ещё раз.",
             keyboard=result_keyboard(),
         )
@@ -340,7 +409,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         temp_path: Path | None = None
         try:
             if photo_url:
-                temp_path = await download_image(photo_url, settings.temp_dir)
+                temp_path = await download_image(photo_url, settings.temp_dir, http_client, settings.image_max_bytes)
                 result = {
                     "anikot": detector.identify_image_anikot,
                     "pro": detector.identify_image_pro,
@@ -363,7 +432,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             if found and found.minor_risk:
                 await refund_search(vk_id, balance_type, refund_ref)
                 await db.log_search(vk_id, kind, mode, logged_query, found.engine, False, "content_rejected")
-                await message.answer("Этот запрос не может быть обработан. Запрос возвращён.", keyboard=await user_main_keyboard(vk_id))
+                await answer(message, "Этот запрос не может быть обработан. Запрос возвращён.", keyboard=await user_main_keyboard(vk_id))
                 return
 
             if found and found.adult_content:
@@ -373,7 +442,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                     return
                 if settings.proplus_require_age_confirmation and not user.get("age_confirmed_at"):
                     await refund_search(vk_id, balance_type, refund_ref)
-                    await message.answer(
+                    await answer(message, 
                         "Для продолжения подтвердите возраст 18+. Запрос возвращён.",
                         keyboard=age_confirmation_keyboard(),
                     )
@@ -387,7 +456,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                     "pro": " Попробуйте Pro+.",
                     "proplus": "",
                 }[mode]
-                await message.answer(
+                await answer(message, 
                     "Не удалось определить аниме с достаточной уверенностью. Запрос возвращён." + next_hint,
                     keyboard=result_keyboard(),
                 )
@@ -406,7 +475,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                     "usage": found.usage or {},
                 },
             )
-            await message.answer(format_result(found), keyboard=result_keyboard())
+            await answer(message, format_result(found), keyboard=result_keyboard())
         except asyncio.CancelledError:
             await refund_search(vk_id, balance_type, refund_ref)
             raise
@@ -414,10 +483,12 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             logger.exception("Search failed")
             await refund_search(vk_id, balance_type, refund_ref)
             await db.log_search(vk_id, "image" if photo_url else "title", mode, query_text or None, None, False, str(exc))
-            await message.answer("Произошла ошибка. Запрос возвращён.", keyboard=await user_main_keyboard(vk_id))
+            await answer(message, "Произошла ошибка. Запрос возвращён.", keyboard=await user_main_keyboard(vk_id))
         finally:
             if temp_path:
                 temp_path.unlink(missing_ok=True)
+                if settings.low_memory_mode:
+                    gc.collect()
             task = search_tasks.get(vk_id)
             if task is asyncio.current_task():
                 search_tasks.pop(vk_id, None)
@@ -432,7 +503,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         user, _created = await db.ensure_user(message.from_id)
         text = (message.text or "").strip()
         lower = text.lower()
-        photo_url = extract_photo_url(message)
+        photo_url = extract_photo_url(message, settings.vk_image_max_side)
 
         ref_payload = _extract_ref_payload(message)
         ref_token = _parse_referral_token(ref_payload)
@@ -445,7 +516,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             if len(parts) >= 2 and parts[1].isdigit():
                 reset = len(parts) >= 3 and parts[2].lower() in {"reset", "clear", "сброс"}
                 await db.unblock_account(int(parts[1]), reset_strikes=reset)
-                await message.answer("Аккаунт разблокирован.", keyboard=await user_main_keyboard(message.from_id))
+                await answer(message, "Аккаунт разблокирован.", keyboard=await user_main_keyboard(message.from_id))
             return
 
         if not user.get("registration_completed_at"):
@@ -454,7 +525,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
 
         blocked, strikes, _reason = await db.is_account_blocked(message.from_id)
         if blocked:
-            await message.answer(
+            await answer(message, 
                 f"⛔ Аккаунт AniKot заблокирован.\nСтрайки: {strikes}/{settings.unsubscribe_strike_limit}.",
                 keyboard=await user_main_keyboard(message.from_id),
             )
@@ -484,7 +555,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         if text == "Режим поиска":
             current = (await db.get_user(message.from_id) or {}).get("search_mode") or "anikot"
             current_name = {"anikot": "Обычный", "pro": "Pro", "proplus": "Pro+"}.get(current, "Обычный")
-            await message.answer(f"Режим поиска AniKot\n\nТекущий режим: {current_name}", keyboard=search_mode_keyboard())
+            await answer(message, f"Режим поиска AniKot\n\nТекущий режим: {current_name}", keyboard=search_mode_keyboard())
             return
 
         if text in {"Обычный", "Pro", "Pro+"}:
@@ -496,7 +567,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         if text == "✅ Мне есть 18 лет":
             await db.confirm_adult_age(message.from_id)
             await db.set_search_mode(message.from_id, "proplus")
-            await message.answer("✅ Возраст подтверждён. Отправьте запрос ещё раз.", keyboard=result_keyboard())
+            await answer(message, "✅ Возраст подтверждён. Отправьте запрос ещё раз.", keyboard=result_keyboard())
             return
 
         if text == "Профиль":
@@ -505,7 +576,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             normal_balance = "∞" if unlimited else user["requests_balance"]
             pro_balance = "∞" if unlimited else user["pro_balance"]
             proplus_balance = "∞" if unlimited else user["proplus_balance"]
-            await message.answer(
+            await answer(message, 
                 f"👤 Профиль AniKot\n\n"
                 f"🔎 AniKot: {normal_balance}\n"
                 f"✨ AniKot Pro: {pro_balance}\n"
@@ -520,7 +591,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             stats = await db.referral_stats(message.from_id)
             link = _referral_link(settings, stats["token"])
             earned = stats["credited"] * settings.referral_reward_pro
-            await message.answer(
+            await answer(message, 
                 "👥 Реферальная система\n\n"
                 f"За друга: +{settings.referral_reward_pro} AniKot Pro\n"
                 f"Проверка нового пользователя: {settings.referral_freeze_days} дня\n"
@@ -538,7 +609,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                 await send_home(message)
                 return
             group_line = settings.vk_group_url or f"https://vk.com/club{settings.vk_group_id}"
-            await message.answer(
+            await answer(message, 
                 f"🎁 За подписку: +{settings.subscription_bonus_requests} AniKot.\n\n"
                 f"После получения бонуса отписка даёт 1 страйк. "
                 f"{settings.unsubscribe_strike_limit} страйка — блокировка аккаунта.",
@@ -551,10 +622,10 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                 member = await is_member(message.from_id)
             except Exception:
                 logger.exception("Subscription check failed")
-                await message.answer("Произошла ошибка. Попробуйте позже.", keyboard=await user_main_keyboard(message.from_id))
+                await answer(message, "Произошла ошибка. Попробуйте позже.", keyboard=await user_main_keyboard(message.from_id))
                 return
             if not member:
-                await message.answer(
+                await answer(message, 
                     "Подписка пока не найдена.",
                     keyboard=subscription_keyboard(settings.vk_group_url or f"https://vk.com/club{settings.vk_group_id}"),
                 )
@@ -569,20 +640,20 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         # Shop root and categories.
         if text == "Купить запросы":
             shop_views[message.from_id] = "root"
-            await message.answer(_shop_root_text(), keyboard=shop_categories_keyboard())
+            await answer(message, _shop_root_text(), keyboard=shop_categories_keyboard())
             return
 
         if text in {"🔎 AniKot", "✨ Pro", "💎 Pro+"}:
             balance_type = {"🔎 AniKot": "anikot", "✨ Pro": "pro", "💎 Pro+": "proplus"}[text]
             shop_views[message.from_id] = balance_type
-            await message.answer(_shop_category_text(balance_type), keyboard=shop_packages_keyboard(balance_type))
+            await answer(message, _shop_category_text(balance_type), keyboard=shop_packages_keyboard(balance_type))
             return
 
         if text == "◀ Назад":
             state = shop_views.get(message.from_id)
             if state and state != "root":
                 shop_views[message.from_id] = "root"
-                await message.answer(_shop_root_text(), keyboard=shop_categories_keyboard())
+                await answer(message, _shop_root_text(), keyboard=shop_categories_keyboard())
             else:
                 shop_views.pop(message.from_id, None)
                 await send_home(message)
@@ -590,17 +661,17 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
 
         if text == "◀ В магазин":
             shop_views[message.from_id] = "root"
-            await message.answer(_shop_root_text(), keyboard=shop_categories_keyboard())
+            await answer(message, _shop_root_text(), keyboard=shop_categories_keyboard())
             return
 
         for key, package in PACKAGES.items():
             if text == _package_button_label(package):
                 if not settings.public_base_url:
-                    await message.answer("Оплата временно недоступна. Попробуйте позже.", keyboard=await user_main_keyboard(message.from_id))
+                    await answer(message, "Оплата временно недоступна. Попробуйте позже.", keyboard=await user_main_keyboard(message.from_id))
                     return
                 token = await db.create_checkout_session(message.from_id, key)
                 checkout_url = f"{settings.public_base_url}/checkout/{token}"
-                await message.answer(
+                await answer(message, 
                     f"Выбран пакет:\n{balance_label(package.balance_type)} — {package.label}\n\nНажмите «Оплатить» для продолжения.",
                     keyboard=package_confirm_keyboard(checkout_url),
                 )
@@ -611,15 +682,15 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             parts = text.split()
             if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
                 await db.add_requests(int(parts[1]), int(parts[2]), "admin", str(uuid.uuid4()), "anikot")
-                await message.answer("Начислено.", keyboard=await user_main_keyboard(message.from_id))
+                await answer(message, "Начислено.", keyboard=await user_main_keyboard(message.from_id))
             elif len(parts) == 4 and parts[1].isdigit() and parts[2].lower() in {"pro", "proplus", "anikot"} and parts[3].isdigit():
                 await db.add_requests(int(parts[1]), int(parts[3]), "admin", str(uuid.uuid4()), parts[2].lower())
-                await message.answer("Начислено.", keyboard=await user_main_keyboard(message.from_id))
+                await answer(message, "Начислено.", keyboard=await user_main_keyboard(message.from_id))
             return
 
         if is_admin(message.from_id) and lower == "/stats":
             stats = await db.stats()
-            await message.answer(
+            await answer(message, 
                 f"👥 Пользователей: {stats['users']}\n"
                 f"⛔ Заблокировано: {stats['blocked']}\n"
                 f"🔎 Поисков: {stats['searches']}\n"
@@ -645,20 +716,20 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
 
         existing = search_tasks.get(message.from_id)
         if existing and not existing.done():
-            await message.answer("Поиск уже выполняется.", keyboard=search_cancel_keyboard())
+            await answer(message, "Поиск уже выполняется.", keyboard=search_cancel_keyboard())
             return
 
         # For explicit text in Pro+ require age before spending a search credit.
         if mode == "proplus" and text and explicit_text(text) and settings.proplus_require_age_confirmation and not user.get("age_confirmed_at"):
-            await message.answer("Для этого запроса подтвердите возраст 18+.", keyboard=age_confirmation_keyboard())
+            await answer(message, "Для этого запроса подтвердите возраст 18+.", keyboard=age_confirmation_keyboard())
             return
 
         balance = await consume_search(message.from_id, mode)
         if balance is None:
-            await message.answer(f"Запросы {balance_label(mode)} закончились.", keyboard=await user_main_keyboard(message.from_id))
+            await answer(message, f"Запросы {balance_label(mode)} закончились.", keyboard=await user_main_keyboard(message.from_id))
             return
 
-        await message.answer("🔍AniKot анализирует кадр..." if photo_url else "🔍AniKot выполняет поиск...", keyboard=search_cancel_keyboard())
+        await answer(message, "🔍AniKot анализирует кадр..." if photo_url else "🔍AniKot выполняет поиск...", keyboard=search_cancel_keyboard())
         refund_ref = str(uuid.uuid4())
         task = asyncio.create_task(
             run_search(message, mode, photo_url, text, refund_ref),
