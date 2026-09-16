@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import logging
 import time
 import uuid
 from contextlib import suppress
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -160,6 +162,22 @@ def _photo_url_from_attachments(attachments: Any, max_side: int) -> str | None:
 
         return min(candidates, key=lambda x: max(x[0], x[1]) or 10**9)[2]
     return None
+
+
+async def _vision_cache_key(path: Path, mode: str, settings: Settings) -> str:
+    digest = hashlib.sha256()
+    async with aiofiles.open(path, "rb") as fh:
+        while True:
+            chunk = await fh.read(256 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    model = {
+        "anikot": settings.aiai_anikot_model,
+        "pro": settings.aiai_pro_model,
+        "proplus": settings.aiai_proplus_model,
+    }.get(mode, mode)
+    return f"{model}:{digest.hexdigest()}"
 
 
 def extract_photo_url(message: Message, max_side: int) -> str | None:
@@ -434,12 +452,27 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         try:
             if photo_url:
                 temp_path = await download_image(photo_url, settings.temp_dir, http_client, settings.image_max_bytes)
-                result = {
-                    "anikot": detector.identify_image_anikot,
-                    "pro": detector.identify_image_pro,
-                    "proplus": detector.identify_image_proplus,
-                }[mode]
-                found = await result(str(temp_path))
+                cache_key = await _vision_cache_key(temp_path, mode, settings)
+                cached = await db.get_vision_cache(cache_key)
+                if cached:
+                    try:
+                        found = AnimeResult(**cached)
+                        logger.info("Vision cache hit mode=%s key=%s", mode, cache_key[:28])
+                    except (TypeError, ValueError):
+                        found = None
+                else:
+                    found = None
+
+                if found is None:
+                    result = {
+                        "anikot": detector.identify_image_anikot,
+                        "pro": detector.identify_image_pro,
+                        "proplus": detector.identify_image_proplus,
+                    }[mode]
+                    found = await result(str(temp_path))
+                    if found is not None:
+                        await db.put_vision_cache(cache_key, asdict(found))
+
                 kind = "image"
                 logged_query = None
             else:
