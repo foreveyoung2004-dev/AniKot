@@ -72,6 +72,7 @@ def format_result(result: AnimeResult) -> str:
 _EMOJI_PREFIXES = (
     "🐾", "✅", "❌", "⚠️", "⛔", "🎁", "🔎", "🔍", "✨", "💎", "👤", "👥",
     "🛒", "💳", "🎬", "📷", "📸", "🔗", "⚙️", "📊", "💰", "📢", "🛡️", "⏳",
+    "🤔", "😿", "💸",
 )
 
 
@@ -122,7 +123,7 @@ def format_uncertain_result(result: AnimeResult) -> str:
             conf_text = f"{alt_conf * 100:.0f}%" if isinstance(alt_conf, (int, float)) else "?"
             lines.append(f"• {alt.get('title', 'Неизвестно')} — {conf_text}")
 
-    lines.extend(["", "💸 Запрос возвращён на баланс."])
+    lines.extend(["", "💸 Запрос не списан."])
     return "\n".join(lines)
 
 
@@ -278,7 +279,7 @@ def _reliable(result: AnimeResult | None, threshold: float) -> bool:
 def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: LavaClient, http_client: httpx.AsyncClient) -> Bot:
     bot = Bot(settings.vk_token)
     search_tasks: dict[int, asyncio.Task] = {}
-    search_context: dict[int, tuple[str, str]] = {}
+    search_context: dict[int, str] = {}
     shop_views: dict[int, str] = {}
     referral_check_lock = asyncio.Lock()
     last_referral_check = 0.0
@@ -306,11 +307,6 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         if is_admin(vk_id):
             return "∞"
         return await db.consume_request(vk_id, balance_type)
-
-    async def refund_search(vk_id: int, balance_type: str, ref: str) -> int | str:
-        if is_admin(vk_id):
-            return "∞"
-        return await db.refund_search_request(vk_id, balance_type, ref)
 
     async def notify_mature_referrals() -> None:
         nonlocal last_referral_check
@@ -429,7 +425,6 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         mode: str,
         photo_url: str | None,
         query_text: str,
-        refund_ref: str,
     ) -> None:
         vk_id = message.from_id
         balance_type = mode
@@ -457,26 +452,22 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
 
             user = await db.get_user(vk_id) or {}
             if found and found.minor_risk:
-                await refund_search(vk_id, balance_type, refund_ref)
                 await db.log_search(vk_id, kind, mode, logged_query, found.engine, False, "content_rejected")
-                await answer(message, "Этот запрос не может быть обработан. Запрос возвращён.", keyboard=await user_main_keyboard(vk_id))
+                await answer(message, "⛔ Этот запрос не может быть обработан. 💸 Запрос не списан.", keyboard=await user_main_keyboard(vk_id))
                 return
 
             if found and found.adult_content:
                 if mode != "proplus":
-                    await refund_search(vk_id, balance_type, refund_ref)
                     await route_to_proplus(message)
                     return
                 if settings.proplus_require_age_confirmation and not user.get("age_confirmed_at"):
-                    await refund_search(vk_id, balance_type, refund_ref)
                     await answer(message, 
-                        "Для продолжения подтвердите возраст 18+. Запрос возвращён.",
+                        "🔞 Для продолжения подтвердите возраст 18+. 💸 Запрос не списан.",
                         keyboard=age_confirmation_keyboard(),
                     )
                     return
 
             if not _reliable(found, _threshold(settings, mode)):
-                await refund_search(vk_id, balance_type, refund_ref)
                 await db.log_search(
                     vk_id,
                     kind,
@@ -502,9 +493,18 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                     await answer(
                         message,
                         "😿 AniKot не смог выделить даже вероятный тайтл по этому кадру. "
-                        "💸 Запрос возвращён на баланс." + next_hint,
+                        "💸 Запрос не списан." + next_hint,
                         keyboard=result_keyboard(),
                     )
+                return
+
+            charged_balance = await consume_search(vk_id, balance_type)
+            if charged_balance is None:
+                await answer(
+                    message,
+                    f"💳 Запросы {balance_label(balance_type)} закончились. Результат не списан и не выдан.",
+                    keyboard=await user_main_keyboard(vk_id),
+                )
                 return
 
             await db.log_search(
@@ -523,13 +523,11 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             )
             await answer(message, format_result(found), keyboard=result_keyboard())
         except asyncio.CancelledError:
-            await refund_search(vk_id, balance_type, refund_ref)
             raise
         except Exception as exc:
             logger.exception("Search failed")
-            await refund_search(vk_id, balance_type, refund_ref)
             await db.log_search(vk_id, "image" if photo_url else "title", mode, query_text or None, None, False, str(exc))
-            await answer(message, "Произошла ошибка. Запрос возвращён.", keyboard=await user_main_keyboard(vk_id))
+            await answer(message, "⚠️ Произошла ошибка. 💸 Запрос не списан.", keyboard=await user_main_keyboard(vk_id))
         finally:
             if temp_path:
                 temp_path.unlink(missing_ok=True)
@@ -581,14 +579,10 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         if text == "Отмена":
             task = search_tasks.get(message.from_id)
             if task and not task.done():
-                context = search_context.get(message.from_id)
-                if context:
-                    cancel_mode, cancel_ref = context
-                    await refund_search(message.from_id, cancel_mode, cancel_ref)
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
-                await send_home(message, "Поиск отменён. Запрос возвращён.")
+                await send_home(message, "🛑 Поиск отменён. 💸 Запрос не списан.")
             else:
                 await send_home(message)
             return
@@ -778,19 +772,28 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             await answer(message, "Для этого запроса подтвердите возраст 18+.", keyboard=age_confirmation_keyboard())
             return
 
-        balance = await consume_search(message.from_id, mode)
-        if balance is None:
-            await answer(message, f"Запросы {balance_label(mode)} закончились.", keyboard=await user_main_keyboard(message.from_id))
-            return
+        if not is_admin(message.from_id):
+            user = await db.get_user(message.from_id) or user
+            balance = {
+                "anikot": int(user.get("requests_balance") or 0),
+                "pro": int(user.get("pro_balance") or 0),
+                "proplus": int(user.get("proplus_balance") or 0),
+            }.get(mode, 0)
+            if balance <= 0:
+                await answer(
+                    message,
+                    f"💳 Запросы {balance_label(mode)} закончились.",
+                    keyboard=await user_main_keyboard(message.from_id),
+                )
+                return
 
-        await answer(message, "🔍AniKot анализирует кадр..." if photo_url else "🔍AniKot выполняет поиск...", keyboard=search_cancel_keyboard())
-        refund_ref = str(uuid.uuid4())
+        await answer(message, "🔍 AniKot анализирует кадр..." if photo_url else "🔍 AniKot выполняет поиск...", keyboard=search_cancel_keyboard())
         task = asyncio.create_task(
-            run_search(message, mode, photo_url, text, refund_ref),
+            run_search(message, mode, photo_url, text),
             name=f"anikot-search-{message.from_id}",
         )
         search_tasks[message.from_id] = task
-        search_context[message.from_id] = (mode, refund_ref)
+        search_context[message.from_id] = mode
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     @bot.on.raw_event(GroupEventType.WALL_REPLY_NEW, dataclass=dict)
