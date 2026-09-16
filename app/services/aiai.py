@@ -95,37 +95,36 @@ class AIAIClient:
     async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 420) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("search_service_unavailable")
-        async with self._semaphore:
-            model = await self._resolve_model()
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.0,
-                "max_tokens": max_tokens,
-            }
-            response = await self.client.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=self.timeout,
+        model = await self._resolve_model()
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        response = await self.client.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                str(block.get("text", "")) if isinstance(block, dict) else str(block)
+                for block in content
             )
-            response.raise_for_status()
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(
-                    str(block.get("text", "")) if isinstance(block, dict) else str(block)
-                    for block in content
-                )
-            result = self._parse_json(str(content))
-            result["_model"] = data.get("model") or model
-            usage = data.get("usage")
-            if isinstance(usage, dict):
-                result["_usage"] = usage
-            return result
+        result = self._parse_json(str(content))
+        result["_model"] = data.get("model") or model
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            result["_usage"] = usage
+        return result
 
     @staticmethod
     def _result_contract() -> str:
@@ -139,62 +138,66 @@ class AIAIClient:
         )
 
     async def identify_anime_from_image(self, image_path: str) -> dict[str, Any]:
-        path = Path(image_path)
-        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-        async with aiofiles.open(path, "rb") as fh:
-            raw = await fh.read()
-        try:
-            encoded = base64.b64encode(raw).decode("ascii")
-        finally:
-            del raw
+        # The global gate is acquired before the file is read/base64-encoded.
+        # This is the key RAM guard: queued searches do not hold large image strings.
+        async with self._semaphore:
+            path = Path(image_path)
+            mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+            async with aiofiles.open(path, "rb") as fh:
+                raw = await fh.read()
+            try:
+                encoded = base64.b64encode(raw).decode("ascii")
+            finally:
+                del raw
 
-        prompt = (
-            "Определи аниме или дунхуа по кадру. Внутренне сравни до трёх кандидатов "
-            "по персонажу, рисовке, одежде, фону, символам и тексту. "
-            "Нужен конкретный тайтл/сезон, если это возможно. "
-            "Для country используй Япония или Китай. "
-            + self._result_contract()
-        )
-        try:
+            prompt = (
+                "Определи аниме или дунхуа по кадру. Внутренне сравни до трёх кандидатов "
+                "по персонажу, рисовке, одежде, фону, символам и тексту. "
+                "Нужен конкретный тайтл/сезон, если это возможно. "
+                "Для country используй Япония или Китай. "
+                + self._result_contract()
+            )
+            try:
+                return await self._chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты специалист по идентификации аниме и дунхуа. "
+                                "Приоритет — точность. Не угадывай при недостатке данных."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+                            ],
+                        },
+                    ],
+                    max_tokens=420,
+                )
+            finally:
+                del encoded
+
+    async def identify_anime_from_text(self, query: str) -> dict[str, Any]:
+        async with self._semaphore:
+            prompt = (
+                f"Пользователь ищет аниме или дунхуа по названию/описанию: {query!r}. "
+                "Исправь опечатки, транслитерацию и альтернативные названия. "
+                "Выбери наиболее вероятный тайтл, но не выдумывай сведения. "
+                + self._result_contract()
+            )
             return await self._chat(
                 [
                     {
                         "role": "system",
                         "content": (
-                            "Ты специалист по идентификации аниме и дунхуа. "
-                            "Приоритет — точность. Не угадывай при недостатке данных."
+                            "Ты специалист по каталогам аниме и дунхуа. "
+                            "Возвращай только сведения, в которых достаточно уверен."
                         ),
                     },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-                        ],
-                    },
+                    {"role": "user", "content": prompt},
                 ],
-                max_tokens=420,
+                max_tokens=360,
             )
-        finally:
-            del encoded
-
-    async def identify_anime_from_text(self, query: str) -> dict[str, Any]:
-        prompt = (
-            f"Пользователь ищет аниме или дунхуа по названию/описанию: {query!r}. "
-            "Исправь опечатки, транслитерацию и альтернативные названия. "
-            "Выбери наиболее вероятный тайтл, но не выдумывай сведения. "
-            + self._result_contract()
-        )
-        return await self._chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты специалист по каталогам аниме и дунхуа. "
-                        "Возвращай только сведения, в которых достаточно уверен."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=360,
-        )
