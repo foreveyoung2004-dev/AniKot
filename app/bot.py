@@ -343,12 +343,7 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                 temp_path = await download_image(photo_url, settings.temp_dir)
                 result = {
                     "anikot": detector.identify_image_anikot,
-                    "pro": detector.identify_title_pro,
-                    "proplus": detector.identify_title_proplus,
-                }[mode]
-                found = await result(query_text)
-                kind = "image"
-                logged_query = None_pro,
+                    "pro": detector.identify_image_pro,
                     "proplus": detector.identify_image_proplus,
                 }[mode]
                 found = await result(str(temp_path))
