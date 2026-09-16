@@ -12,19 +12,19 @@ import httpx
 
 
 class AIAIClient:
+    """Small OpenAI-compatible client used by one AniKot search tier."""
+
     def __init__(
         self,
         api_key: str,
         base_url: str,
         preferred_model: str,
-        fallback_model: str,
         timeout: float = 90,
         max_concurrency: int = 6,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.preferred_model = preferred_model
-        self.fallback_model = fallback_model
         self.timeout = timeout
         self._resolved_model: str | None = None
         self._model_lock = asyncio.Lock()
@@ -33,6 +33,10 @@ class AIAIClient:
     @property
     def enabled(self) -> bool:
         return bool(self.api_key)
+
+    @staticmethod
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
 
     async def _resolve_model(self, client: httpx.AsyncClient) -> str:
         if self._resolved_model:
@@ -49,58 +53,50 @@ class AIAIClient:
                 data = response.json().get("data", [])
                 ids = [str(x.get("id", "")) for x in data if x.get("id")]
                 lower = {x.lower(): x for x in ids}
-                preferred = self.preferred_model.lower()
-                fallback = self.fallback_model.lower()
-                if preferred in lower:
-                    self._resolved_model = lower[preferred]
+                wanted = self.preferred_model.lower()
+                if wanted in lower:
+                    self._resolved_model = lower[wanted]
                 else:
-                    # Model IDs can differ only by punctuation/case between the
-                    # public catalogue and /v1/models. Match a normalized ID
-                    # before falling back to another model family.
-                    norm = lambda v: re.sub(r"[^a-z0-9]+", "", v.lower())
-                    wanted_norm = norm(self.preferred_model)
-                    fuzzy = [
-                        x for x in ids
-                        if norm(x) == wanted_norm or norm(x).endswith(wanted_norm) or wanted_norm in norm(x)
+                    wanted_norm = self._norm(self.preferred_model)
+                    matches = [
+                        model_id
+                        for model_id in ids
+                        if self._norm(model_id) == wanted_norm
+                        or self._norm(model_id).endswith(wanted_norm)
+                        or wanted_norm in self._norm(model_id)
                     ]
-                    if fuzzy:
-                        self._resolved_model = fuzzy[0]
-                    elif fallback in lower:
-                        self._resolved_model = lower[fallback]
-                    else:
-                        fallback_norm = norm(self.fallback_model)
-                        fuzzy_fallback = [
-                            x for x in ids
-                            if norm(x) == fallback_norm or norm(x).endswith(fallback_norm) or fallback_norm in norm(x)
-                        ]
-                        self._resolved_model = fuzzy_fallback[0] if fuzzy_fallback else self.preferred_model
+                    self._resolved_model = matches[0] if matches else self.preferred_model
             except Exception:
+                # Use the configured ID directly. The actual request will fail cleanly
+                # and the caller will refund the user's search credit.
                 self._resolved_model = self.preferred_model
             return self._resolved_model
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
-        text = text.strip()
+        text = (text or "").strip()
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
         text = re.sub(r"\s*```$", "", text)
         try:
-            return json.loads(text)
+            value = json.loads(text)
+            return value if isinstance(value, dict) else {"raw": value}
         except json.JSONDecodeError:
             match = re.search(r"\{.*\}", text, flags=re.S)
             if not match:
                 return {"raw": text}
-            return json.loads(match.group(0))
+            value = json.loads(match.group(0))
+            return value if isinstance(value, dict) else {"raw": value}
 
-    async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 700) -> dict[str, Any]:
+    async def _chat(self, messages: list[dict[str, Any]], max_tokens: int = 650) -> dict[str, Any]:
         if not self.enabled:
-            raise RuntimeError("AIAI_API_KEY не задан")
+            raise RuntimeError("search_service_unavailable")
         async with self._semaphore:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 model = await self._resolve_model(client)
                 payload = {
                     "model": model,
                     "messages": messages,
-                    "temperature": 0.1,
+                    "temperature": 0.0,
                     "max_tokens": max_tokens,
                 }
                 response = await client.post(
@@ -111,40 +107,63 @@ class AIAIClient:
                     },
                     json=payload,
                 )
-                if response.status_code >= 400 and model != self.fallback_model:
-                    payload["model"] = self.fallback_model
-                    response = await client.post(
-                        f"{self.base_url}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {self.api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json=payload,
-                    )
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
-                result = self._parse_json(content)
-                result["_model"] = data.get("model") or payload["model"]
+                if isinstance(content, list):
+                    # Some OpenAI-compatible providers return content blocks.
+                    content = "".join(
+                        str(block.get("text", "")) if isinstance(block, dict) else str(block)
+                        for block in content
+                    )
+                result = self._parse_json(str(content))
+                result["_model"] = data.get("model") or model
+                usage = data.get("usage")
+                if isinstance(usage, dict):
+                    result["_usage"] = usage
                 return result
+
+    @staticmethod
+    def _result_contract() -> str:
+        return (
+            'Верни ТОЛЬКО JSON по схеме: '
+            '{"title":"точное название",'
+            '"character":"имя персонажа или Неизвестно",'
+            '"country":"Япония или Китай",'
+            '"year":2024,'
+            '"episodes":12,'
+            '"confidence":0.0,'
+            '"adult_content":false,'
+            '"minor_risk":false}. '
+            'confidence — число от 0 до 1. Если точного ответа нет, не угадывай: '
+            'оставь title пустым и поставь низкую confidence. '
+            'year и episodes могут быть null, если нельзя определить надёжно. '
+            'minor_risk=true только когда adult_content=true и есть признаки несовершеннолетнего '
+            'или возраст персонажа в сексуальном контексте неоднозначен.'
+        )
 
     async def identify_anime_from_image(self, image_path: str) -> dict[str, Any]:
         path = Path(image_path)
         mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         prompt = (
-            "Определи аниме по кадру. Не выдумывай название. Если уверенность низкая, так и укажи. "
-            "Одновременно классифицируй, относится ли кадр к явно adult/explicit аниме-контенту. "
-            "minor_risk=true ставь только если adult_content=true и персонаж может быть несовершеннолетним "
-            "или возраст неоднозначен. Не описывай сексуальные действия. "
-            "Верни ТОЛЬКО JSON: {\"title\":\"каноническое название\",\"title_ru\":\"русское название или пусто\","
-            "\"confidence\":0.0,\"characters\":[\"...\"],\"evidence\":\"кратко почему\","
-            "\"adult_content\":false,\"minor_risk\":false,\"reason\":\"кратко\"}. "
-            "confidence — число от 0 до 1."
+            "Определи произведение по этому аниме/дунхуа-кадру. "
+            "Перед финальным ответом внутренне сравни до трёх наиболее вероятных кандидатов по персонажу, "
+            "дизайну, фону, рисовке, одежде, символам и тексту на кадре. "
+            "Нужен именно тайтл конкретного произведения/сезона, а не название франшизы, если это возможно. "
+            "Для country используй Япония для аниме и Китай для дунхуа. "
+            "Не описывай сексуальные действия и не давай ссылки на adult-контент. "
+            + self._result_contract()
         )
         return await self._chat(
             [
-                {"role": "system", "content": "Ты эксперт по аниме и распознаванию кадров."},
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты профессиональный специалист по идентификации аниме и дунхуа. "
+                        "Приоритет — точность; не выдумывай сведения, когда не уверен."
+                    ),
+                },
                 {
                     "role": "user",
                     "content": [
@@ -155,82 +174,23 @@ class AIAIClient:
             ]
         )
 
-    async def normalize_title(self, title: str) -> dict[str, Any]:
+    async def identify_anime_from_text(self, query: str) -> dict[str, Any]:
         prompt = (
-            f"Пользователь ищет аниме по названию: {title!r}. Исправь возможную опечатку или русскую транслитерацию. "
-            "Верни ТОЛЬКО JSON: {\"title\":\"наиболее вероятное каноническое название для поиска\","
-            "\"alternatives\":[\"...\"],\"confidence\":0.0}. Не придумывай, если не уверен."
-        )
-        return await self._chat(
-            [
-                {"role": "system", "content": "Ты нормализуешь названия аниме для каталожного поиска."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=300,
-        )
-
-    async def identify_adult_anime_from_image(
-        self,
-        image_path: str,
-        tag_hints: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Adult-title identification for AniKot Pro+.
-
-        This method is intentionally limited to title/source identification.
-        It must refuse/flag any case with underage or ambiguous-age indicators.
-        """
-        path = Path(image_path)
-        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        hints = ", ".join((tag_hints or [])[:24])
-        prompt = (
-            "Задача: определить НАЗВАНИЕ/ИСТОЧНИК adult-аниме по кадру, без описания сексуальных действий "
-            "и без ссылок на просмотр. Если персонаж может быть несовершеннолетним, выглядит несовершеннолетним "
-            "или возраст неоднозначен, НЕ определяй тайтл и поставь minor_risk=true. "
-            f"Подсказки локальных теггеров: {hints or 'нет'}. "
-            "Верни ТОЛЬКО JSON: "
-            "{\"title\":\"каноническое название или пусто\",\"title_ru\":\"русское название или пусто\","
-            "\"confidence\":0.0,\"adult_content\":true,\"minor_risk\":false,"
-            "\"reason\":\"кратко\",\"evidence\":\"только признаки источника/персонажа, без сексуального описания\"}."
+            f"Пользователь ищет аниме или дунхуа по названию/описанию: {query!r}. "
+            "Исправь опечатки, русскую транслитерацию и альтернативные названия, затем выбери наиболее вероятный тайтл. "
+            "Для country используй Япония или Китай. Не выдумывай сведения. "
+            + self._result_contract()
         )
         return await self._chat(
             [
                 {
                     "role": "system",
                     "content": (
-                        "Ты классификатор источника аниме. Для adult-контента допускается только нейтральная "
-                        "идентификация произведения. Любой риск несовершеннолетнего или неоднозначного возраста "
-                        "означает minor_risk=true и пустой title."
+                        "Ты профессиональный специалист по каталогам аниме и дунхуа. "
+                        "Возвращай только сведения, в которых достаточно уверен."
                     ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-                    ],
-                },
-            ],
-            max_tokens=500,
-        )
-
-    async def normalize_adult_title(self, title: str) -> dict[str, Any]:
-        prompt = (
-            f"Нормализуй только название adult-аниме для каталожного поиска: {title!r}. "
-            "Не описывай сексуальный контент и не давай ссылки. Если запрос явно относится к сексуальному "
-            "контенту с несовершеннолетним или возраст неоднозначен, верни minor_risk=true и пустой title. "
-            "Верни ТОЛЬКО JSON: "
-            "{\"title\":\"каноническое название или пусто\",\"confidence\":0.0,"
-            "\"minor_risk\":false,\"reason\":\"кратко\"}."
-        )
-        return await self._chat(
-            [
-                {
-                    "role": "system",
-                    "content": "Ты нормализуешь названия для каталога; не генерируешь эротические описания.",
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=260,
+            max_tokens=550,
         )
-

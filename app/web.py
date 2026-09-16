@@ -54,7 +54,7 @@ button{{width:100%;border:0;border-radius:13px;padding:14px 16px;margin-top:14px
 .error{{background:#3a1721;color:#ffd6df;border-radius:12px;padding:10px 12px}} .note{{font-size:13px;color:#9989ad;margin-top:14px;line-height:1.45}}
 </style></head><body><main class="card"><h1>🐾 AniKot</h1><p class="muted">Оформление оплаты</p><div class="pkg">{safe_label}</div>{error_html}
 <form method="post" action="{safe_action}"><label for="email">Email для оформления платежа</label><input id="email" name="email" type="email" autocomplete="email" required placeholder="name@example.com"><button type="submit">Перейти к оплате</button></form>
-<p class="note">После продолжения откроется защищённая страница оплаты LAVA. После подтверждения платежа запросы будут начислены автоматически.</p></main></body></html>"""
+<p class="note">После продолжения откроется защищённая страница оплаты. После подтверждения платежа запросы будут начислены автоматически.</p></main></body></html>"""
 
 
 def build_web_app(
@@ -72,17 +72,14 @@ def build_web_app(
 
     @app.get("/")
     async def root():
-        return {"ok": True, "service": "AniKot", "version": "1.5.1-bothost"}
+        return {"ok": True, "service": "AniKot", "version": "1.6.0-bothost"}
 
     @app.get("/health")
     async def health(request: Request):
-        model_manager = getattr(request.app.state, "model_manager", None)
-        lava = getattr(request.app.state, "lava", None)
-        models = model_manager.status() if model_manager else None
         return {
             "ok": True,
             "bot": "AniKot",
-            "version": "1.5.1-bothost",
+            "version": "1.6.0-bothost",
             "runtime_ready": bool(getattr(request.app.state, "runtime_ready", False)),
             "ready": bool(getattr(request.app.state, "runtime_ready", False)),
         }
@@ -159,18 +156,20 @@ def build_web_app(
         if not result:
             return {"ok": True, "matched": False}
 
-        was_new, vk_id, balance, btype, requests_count = result
+        was_new, vk_id, _balance, btype, requests_count = result
         if was_new:
             try:
+                user = await db.get_user(vk_id)
+                keyboard = main_keyboard(show_subscription_bonus=not bool((user or {}).get("subscription_bonus_claimed")))
                 await bot.api.messages.send(
                     peer_id=vk_id,
                     random_id=0,
                     message=(f"✅ Оплата получена.\n"
                              f"Начислено: +{requests_count} {_label(btype)}."),
-                    keyboard=main_keyboard(),
+                    keyboard=keyboard,
                 )
             except Exception:
-                logger.exception("Failed to notify VK user")
+                logger.exception("Payment notification failed")
         return {"ok": True, "matched": True, "credited": was_new}
 
     return app

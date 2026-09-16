@@ -1,0 +1,147 @@
+ult, "member", result))
+
+    def is_admin(vk_id: int) -> bool:
+        return vk_id in settings.admin_ids
+
+    async def user_main_keyboard(vk_id: int) -> str:
+        user = await db.get_user(vk_id)
+        show_bonus = not bool((user or {}).get("subscription_bonus_claimed"))
+        return main_keyboard(show_subscription_bonus=show_bonus)
+
+    async def send_home(message: Message, text: str = "🐾 AniKot\n\nВыберите нужный раздел:") -> None:
+        await message.answer(text, keyboard=await user_main_keyboard(message.from_id))
+
+    async def consume_search(vk_id: int, balance_type: str) -> int | str | None:
+        if is_admin(vk_id):
+            return "∞"
+        return await db.consume_request(vk_id, balance_type)
+
+    async def refund_search(vk_id: int, balance_type: str, ref: str) -> int | str:
+        if is_admin(vk_id):
+            return "∞"
+        return await db.refund_search_request(vk_id, balance_type, ref)
+
+    async def notify_mature_referrals() -> None:
+        try:
+            rewards = await db.release_mature_referrals()
+            for reward in rewards:
+                try:
+                    await bot.api.messages.send(
+                        peer_id=reward["referrer_vk_id"],
+                        random_id=0,
+                        message=f"🎁 Реферальная награда: +{reward['amount']} AniKot Pro.",
+                        keyboard=await user_main_keyboard(reward["referrer_vk_id"]),
+                    )
+                except Exception:
+                    logger.exception("Referral notification failed")
+        except Exception:
+            logger.exception("Referral processing failed")
+
+    async def send_legal(message: Message) -> None:
+        agreement = _vk_text_link("Пользовательское соглашение", settings.user_agreement_url)
+        privacy = _vk_text_link("Политику конфиденциальности", settings.privacy_policy_url)
+        await message.answer(
+            f"Продолжая регистрацию, вы принимаете {agreement} и {privacy}.",
+            keyboard=legal_keyboard(),
+        )
+
+    async def send_referral_question(message: Message, user: dict[str, Any]) -> None:
+        has_candidate = bool(user.get("referral_candidate_token"))
+        text = (
+            "Реферальная ссылка обнаружена. Использовать её для регистрации?"
+            if has_candidate
+            else "У вас есть реферальная ссылка?"
+        )
+        await message.answer(text, keyboard=referral_choice_keyboard(has_candidate))
+
+    async def finish_registration(message: Message) -> None:
+        await db.complete_registration(message.from_id)
+        await send_home(
+            message,
+            f"✅ Регистрация завершена.\n🎁 Начислено: +{settings.initial_pro_requests} AniKot Pro за регистрацию.",
+        )
+
+    async def handle_onboarding(message: Message, user: dict[str, Any], text: str) -> bool:
+        state = user.get("onboarding_state") or "legal"
+        if state == "legal":
+            if text == "✅ Согласен":
+                await db.accept_legal(message.from_id)
+                user = await db.get_user(message.from_id) or user
+                await send_referral_question(message, user)
+            else:
+                await send_legal(message)
+            return True
+
+        if state == "referral_choice":
+            candidate = user.get("referral_candidate_token")
+            if text == "✅ Использовать реферальную ссылку" and candidate:
+                ok, _ = await db.apply_referral_token(message.from_id, str(candidate))
+                if ok:
+                    await finish_registration(message)
+                else:
+                    await db.set_referral_candidate(message.from_id, None)
+                    await message.answer("Ссылка не подошла.", keyboard=referral_choice_keyboard(False))
+                return True
+            if text == "Да, есть ссылка":
+                await db.set_onboarding_state(message.from_id, "referral_link")
+                await message.answer("Отправьте реферальную ссылку одним сообщением.", keyboard=referral_input_keyboard())
+                return True
+            if text in {"Нет, продолжить", "Продолжить без ссылки"}:
+                await finish_registration(message)
+                return True
+            await send_referral_question(message, user)
+            return True
+
+        if state == "referral_link":
+            if text == "Продолжить без ссылки":
+                await finish_registration(message)
+                return True
+            token = _parse_referral_token(text)
+            if not token:
+                await message.answer("Не удалось распознать ссылку.", keyboard=referral_input_keyboard())
+                return True
+            ok, _ = await db.apply_referral_token(message.from_id, token)
+            if not ok:
+                await message.answer("Эта ссылка не подошла.", keyboard=referral_input_keyboard())
+                return True
+            await finish_registration(message)
+            return True
+
+        await finish_registration(message)
+        return True
+
+    async def route_to_proplus(message: Message) -> None:
+        await db.set_search_mode(message.from_id, "proplus")
+        user = await db.get_user(message.from_id)
+        if settings.proplus_require_age_confirmation and not (user or {}).get("age_confirmed_at"):
+            await message.answer(
+                "Для этого запроса требуетсся AniKot Pro+ и подтверждения возраста 18+.",
+                keyboard=age_confirmation_keyboard(),
+            )
+            return
+        await message.answer(
+            "Для этого запроса требуется AniKot Pro+. Отправьте запрос ещё раз.",
+            keyboard=result_keyboard(),
+        )
+
+    async def run_search(
+        message: Message,
+        mode: str,
+        photo_url: str | None,
+        query_text: str,
+        refund_ref: str,
+    ) -> None:
+        vk_id = message.from_id
+        balance_type = mode
+        temp_path: Path | None = None
+        try:
+            if photo_url:
+                temp_path = await download_image(photo_url, settings.temp_dir)
+                result = {
+                    "anikot": detector.identify_image_anikot,
+                    "pro": detector.identify_title_pro,
+                    "proplus": detector.identify_title_proplus,
+                }[mode]
+                found = await result(query_text)
+                kind = "image"
+                logged_query = None

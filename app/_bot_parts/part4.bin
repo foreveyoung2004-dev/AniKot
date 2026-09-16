@@ -1,0 +1,128 @@
+d=search_mode_keyboard())
+            return
+
+        if text in {"Обычный", "Pro", "Pro+"}:
+            mode = {"Обычный": "anikot", "Pro": "pro", "Pro+": "proplus"}[text]
+            await db.set_search_mode(message.from_id, mode)
+            await send_home(message, f"✅ Режим поиска: {text}")
+            return
+
+        if text == "✅ Мне есть 18 лет":
+            await db.confirm_adult_age(message.from_id)
+            await db.set_search_mode(message.from_id, "proplus")
+            await message.answer("✅ Возраст подтверждён. Отправьте запрос ещё раз.", keyboard=result_keyboard())
+            return
+
+        if text == "Профиль":
+            user = await db.get_user(message.from_id) or user
+            unlimited = is_admin(message.from_id)
+            normal_balance = "∞" if unlimited else user["requests_balance"]
+            pro_balance = "∞" if unlimited else user["pro_balance"]
+            proplus_balance = "∞" if unlimited else user["proplus_balance"]
+            await message.answer(
+                f"👤 Профиль AniKot\n\n"
+                f"🔎 AniKot: {normal_balance}\n"
+                f"✨ AniKot Pro: {pro_balance}\n"
+                f"💎 AniKot Pro+: {proplus_balance}\n"
+                f"📊 Поисков: {user['total_searches']}\n"
+                f"⚠️ Страйки: {user['unsubscribe_strikes']}/{settings.unsubscribe_strike_limit}",
+                keyboard=profile_keyboard(),
+            )
+            return
+
+        if text == "Рефералы":
+            stats = await db.referral_stats(message.from_id)
+            link = _referral_link(settings, stats["token"])
+            earned = stats["credited"] * settings.referral_reward_pro
+            await message.answer(
+                "👥 Реферальная система\n\n"
+                f"За друга: +{settings.referral_reward_pro} AniKot Pro\n"
+                f"Проверка нового пользователя: {settings.referral_freeze_days} дня\n"
+                f"На проверке: {stats['pending']}\n"
+                f"Зачислено друзей: {stats['credited']}\n"
+                f"Получено AniKot Pro: {earned}\n\n"
+                f"Ваша ссылка:\n{link}",
+                keyboard=referral_keyboard(),
+            )
+            return
+
+        if text == "Бонус за подписку":
+            user = await db.get_user(message.from_id) or user
+            if user.get("subscription_bonus_claimed"):
+                await send_home(message)
+                return
+            group_line = settings.vk_group_url or f"https://vk.com/club{settings.vk_group_id}"
+            await message.answer(
+                f"🎁 За подписку: +{settings.subscription_bonus_pro} AniKot Pro.\n\n"
+                f"После получения бонуса отписка даёт 1 страйк. "
+                f"{settings.unsubscribe_strike_limit} страйка — блокировка аккаунта.",
+                keyboard=subscription_keyboard(group_line),
+            )
+            return
+
+        if text == "Проверить подписку" or lower == "проверить подписку":
+            try:
+                member = await is_member(message.from_id)
+            except Exception:
+                logger.exception("Subscription check failed")
+                await message.answer("Произошла ошибка. Попробуйте позже.", keyboard=await user_main_keyboard(message.from_id))
+                return
+            if not member:
+                await message.answer(
+                    "Подписка пока не найдена.",
+                    keyboard=subscription_keyboard(settings.vk_group_url or f"https://vk.com/club{settings.vk_group_id}"),
+                )
+                return
+            claimed, _balance = await db.claim_subscription_bonus(message.from_id)
+            await send_home(
+                message,
+                f"✅ Начислено: +{settings.subscription_bonus_pro} AniKot Pro." if claimed else "Бонус уже был получен.",
+            )
+            return
+
+        # Shop root and categories.
+        if text == "Купить запросы":
+            shop_views[message.from_id] = "root"
+            await message.answer(_shop_root_text(), keyboard=shop_categories_keyboard())
+            return
+
+        if text in {"🔎 AniKot", "✨ Pro", "💎 Pro+"}:
+            balance_type = {"🔎 AniKot": "anikot", "✨ Pro": "pro", "💎 Pro+": "proplus"}[text]
+            shop_views[message.from_id] = balance_type
+            await message.answer(_shop_category_text(balance_type), keyboard=shop_packages_keyboard(balance_type))
+            return
+
+        if text == "◀ Назад":
+            state = shop_views.get(message.from_id)
+            if state and state != "root":
+                shop_views[message.from_id] = "root"
+                await message.answer(_shop_root_text(), keyboard=shop_categories_keyboard())
+            else:
+                shop_views.pop(message.from_id, None)
+                await send_home(message)
+            return
+
+        if text == "◀ В магазин":
+            shop_views[message.from_id] = "root"
+            await message.answer(_shop_root_text(), keyboard=shop_categories_keyboard())
+            return
+
+        for key, package in PACKAGES.items():
+            if text == _package_button_label(package):
+                if not settings.public_base_url:
+                    await message.answer("Оплата временно недоступна. Попробуйте позже.", keyboard=await user_main_keyboard(message.from_id))
+                    return
+                token = await db.create_checkout_session(message.from_id, key)
+                checkout_url = f"{settings.public_base_url}/checkout/{token}"
+                await message.answer(
+                    f"Выбран пакет:\n{balance_label(package.balance_type)} — {package.label}\n\nНажмите «Оплатить» для продолжения.",
+                    keyboard=package_confirm_keyboard(checkout_url),
+                )
+                return
+
+        # Admin helpers. Admin search balances are always unlimited and are never decremented.
+        if is_admin(message.from_id) and lower.startswith("/add "):
+            parts = text.split()
+            if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+                await db.add_requests(int(parts[1]), int(parts[2]), "admin", str(uuid.uuid4()), "anikot")
+                await message.answer("Начисле

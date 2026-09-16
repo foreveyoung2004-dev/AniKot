@@ -1,0 +1,142 @@
+_pro,
+                    "proplus": detector.identify_image_proplus,
+                }[mode]
+                found = await result(str(temp_path))
+                kind = "image"
+                logged_query = None
+            else:
+                result = {
+                    "anikot": detector.identify_title_anikot,
+                    "pro": detector.identify_title_pro,
+                    "proplus": detector.identify_title_proplus,
+                }[mode]
+                found = await result(query_text)
+                kind = "title"
+                logged_query = query_text
+
+            user = await db.get_user(vk_id) or {}
+            if found and found.minor_risk:
+                await refund_search(vk_id, balance_type, refund_ref)
+                await db.log_search(vk_id, kind, mode, logged_query, found.engine, False, "content_rejected")
+                await message.answer("Этот запрос не может быть обработан. Запрос возвращён.", keyboard=await user_main_keyboard(vk_id))
+                return
+
+            if found and found.adult_content:
+                if mode != "proplus":
+                    await refund_search(vk_id, balance_type, refund_ref)
+                    await route_to_proplus(message)
+                    return
+                if settings.proplus_require_age_confirmation and not user.get("age_confirmed_at"):
+                    await refund_search(vk_id, balance_type, refund_ref)
+                    await message.answer(
+                        "Для продолжения подтвердите возраст 18+. Запрос возвращён.",
+                        keyboard=age_confirmation_keyboard(),
+                    )
+                    return
+
+            if not _reliable(found, _threshold(settings, mode)):
+                await refund_search(vk_id, balance_type, refund_ref)
+                await db.log_search(vk_id, kind, mode, logged_query, found.engine if found else None, False, "low_confidence")
+                next_hint = {
+                    "anikot": " Попробуйте Pro.",
+                    "pro": " Попробуйте Pro+.",
+                    "proplus": "",
+                }[mode]
+                await message.answer(
+                    "Не удалось определить аниме с достаточной уверенностью. Запрос возвращён." + next_hint,
+                    keyboard=result_keyboard(),
+                )
+                return
+
+            await db.log_search(
+                vk_id,
+                kind,
+                mode,
+                logged_query,
+                found.engine,
+                True,
+                {
+                    "title": found.title,
+                    "confidence": found.confidence,
+                    "usage": found.usage or {},
+                },
+            )
+            await message.answer(format_result(found), keyboard=result_keyboard())
+        except asyncio.CancelledError:
+            await refund_search(vk_id, balance_type, refund_ref)
+            raise
+        except Exception as exc:
+            logger.exception("Search failed")
+            await refund_search(vk_id, balance_type, refund_ref)
+            await db.log_search(vk_id, "image" if photo_url else "title", mode, query_text or None, None, False, str(exc))
+            await message.answer("Произошла ошибка. Запрос возвращён.", keyboard=await user_main_keyboard(vk_id))
+        finally:
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
+            task = search_tasks.get(vk_id)
+            if task is asyncio.current_task():
+                search_tasks.pop(vk_id, None)
+                search_context.pop(vk_id, None)
+
+    @bot.on.message()
+    async def all_messages(message: Message):
+        if message.from_id <= 0:
+            return
+
+        await notify_mature_referrals()
+        user, _created = await db.ensure_user(message.from_id)
+        text = (message.text or "").strip()
+        lower = text.lower()
+        photo_url = extract_photo_url(message)
+
+        ref_payload = _extract_ref_payload(message)
+        ref_token = _parse_referral_token(ref_payload)
+        if ref_token and not user.get("registration_completed_at") and not user.get("referrer_vk_id"):
+            await db.set_referral_candidate(message.from_id, ref_token)
+            user = await db.get_user(message.from_id) or user
+
+        if is_admin(message.from_id) and lower.startswith("/unblock "):
+            parts = text.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                reset = len(parts) >= 3 and parts[2].lower() in {"reset", "clear", "сброс"}
+                await db.unblock_account(int(parts[1]), reset_strikes=reset)
+                await message.answer("Аккаунт разблокирован.", keyboard=await user_main_keyboard(message.from_id))
+            return
+
+        if not user.get("registration_completed_at"):
+            await handle_onboarding(message, user, text)
+            return
+
+        blocked, strikes, _reason = await db.is_account_blocked(message.from_id)
+        if blocked:
+            await message.answer(
+                f"⛔ Аккаунт AniKot заблокирован.\nСтрайки: {strikes}/{settings.unsubscribe_strike_limit}.",
+                keyboard=await user_main_keyboard(message.from_id),
+            )
+            return
+
+        # Search cancellation is processed before any navigation.
+        if text == "Отмена":
+            task = search_tasks.get(message.from_id)
+            if task and not task.done():
+                context = search_context.get(message.from_id)
+                if context:
+                    cancel_mode, cancel_ref = context
+                    await refund_search(message.from_id, cancel_mode, cancel_ref)
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                await send_home(message, "Поиск отменён. Запрос возвращён.")
+            else:
+                await send_home(message)
+            return
+
+        # Home navigation.
+        if lower in {"start", "/start", "начать", "меню", "назад"}:
+            await send_home(message)
+            return
+
+        if text == "Режим поиска":
+            current = (await db.get_user(message.from_id) or {}).get("search_mode") or "anikot"
+            current_name = {"anikot": "Обычный", "pro": "Pro", "proplus": "Pro+"}.get(current, "Обычный")
+            await message.answer(f"Режим поиска AniKot\n\nТекущий режим: {current_name}", keyboar
