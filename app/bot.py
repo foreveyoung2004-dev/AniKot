@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -72,7 +73,7 @@ def format_result(result: AnimeResult) -> str:
 _EMOJI_PREFIXES = (
     "🐾", "✅", "❌", "⚠️", "⛔", "🎁", "🔎", "🔍", "✨", "💎", "👤", "👥",
     "🛒", "💳", "🎬", "📷", "📸", "🔗", "⚙️", "📊", "💰", "📢", "🛡️", "⏳",
-    "🤔", "😿", "💸",
+    "🤔", "😿", "💸", "🚫", "🕒", "🔞",
 )
 
 
@@ -451,6 +452,58 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                 logged_query = query_text
 
             user = await db.get_user(vk_id) or {}
+
+            if (
+                photo_url
+                and found
+                and not found.is_anime
+                and (
+                    found.anime_likelihood is None
+                    or found.anime_likelihood <= settings.non_anime_max_likelihood
+                )
+            ):
+                await db.log_search(
+                    vk_id,
+                    kind,
+                    mode,
+                    None,
+                    found.engine,
+                    False,
+                    {
+                        "reason": "non_anime",
+                        "anime_likelihood": found.anime_likelihood,
+                    },
+                )
+                if is_admin(vk_id):
+                    await answer(
+                        message,
+                        "🚫 На изображении не обнаружено аниме или дунхуа. 💸 Запрос не списан.",
+                        keyboard=result_keyboard(),
+                    )
+                    return
+
+                warning = await db.register_non_anime_warning(vk_id)
+                if warning.get("blocked"):
+                    await answer(
+                        message,
+                        f"⛔ На изображении не обнаружено аниме или дунхуа.\n"
+                        f"⚠️ Предупреждение {warning['warnings']}/{warning['limit']}.\n"
+                        f"🕒 Доступ к AniKot заблокирован на {settings.non_anime_block_days} дней.\n"
+                        f"💸 Запрос не списан.",
+                        keyboard=result_keyboard(),
+                    )
+                else:
+                    await answer(
+                        message,
+                        f"🚫 На изображении не обнаружено аниме или дунхуа.\n"
+                        f"⚠️ Предупреждение {warning['warnings']}/{warning['limit']}.\n"
+                        f"После {warning['limit']} предупреждений доступ блокируется на "
+                        f"{settings.non_anime_block_days} дней.\n"
+                        f"💸 Запрос не списан.",
+                        keyboard=result_keyboard(),
+                    )
+                return
+
             if found and found.minor_risk:
                 await db.log_search(vk_id, kind, mode, logged_query, found.engine, False, "content_rejected")
                 await answer(message, "⛔ Этот запрос не может быть обработан. 💸 Запрос не списан.", keyboard=await user_main_keyboard(vk_id))
@@ -483,7 +536,19 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                     },
                 )
                 if found and found.title:
-                    await answer(message, format_uncertain_result(found), keyboard=result_keyboard())
+                    charged_balance = await consume_search(vk_id, balance_type)
+                    if charged_balance is None:
+                        await answer(
+                            message,
+                            f"💳 Запросы {balance_label(balance_type)} закончились. Результат не выдан.",
+                            keyboard=await user_main_keyboard(vk_id),
+                        )
+                        return
+                    uncertain_text = format_uncertain_result(found).replace(
+                        "💸 Запрос не списан.",
+                        "💳 Списан 1 запрос за полученный вероятный результат.",
+                    )
+                    await answer(message, uncertain_text, keyboard=result_keyboard())
                 else:
                     next_hint = {
                         "anikot": " ✨ Попробуйте режим Pro.",
@@ -567,12 +632,26 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
             await handle_onboarding(message, user, text)
             return
 
-        blocked, strikes, _reason = await db.is_account_blocked(message.from_id)
+        blocked, strikes, block_reason, blocked_until = await db.is_account_blocked(message.from_id)
         if blocked:
-            await answer(message, 
-                f"⛔ Аккаунт AniKot заблокирован.\nСтрайки: {strikes}/{settings.unsubscribe_strike_limit}.",
-                keyboard=await user_main_keyboard(message.from_id),
-            )
+            if block_reason == "non_anime_abuse" and blocked_until:
+                try:
+                    until_dt = datetime.fromisoformat(blocked_until)
+                    until_text = until_dt.strftime("%d.%m.%Y %H:%M UTC")
+                except Exception:
+                    until_text = blocked_until
+                await answer(
+                    message,
+                    f"⛔ Доступ к AniKot временно заблокирован за повторную отправку не-аниме изображений.\n"
+                    f"🕒 Блокировка действует до {until_text}.",
+                    keyboard=await user_main_keyboard(message.from_id),
+                )
+            else:
+                await answer(
+                    message,
+                    f"⛔ Аккаунт AniKot заблокирован.\n⚠️ Страйки: {strikes}/{settings.unsubscribe_strike_limit}.",
+                    keyboard=await user_main_keyboard(message.from_id),
+                )
             return
 
         # Search cancellation is processed before any navigation.
@@ -622,7 +701,8 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
                 f"✨ AniKot Pro: {pro_balance}\n"
                 f"💎 AniKot Pro+: {proplus_balance}\n"
                 f"📊 Поисков: {user['total_searches']}\n"
-                f"⚠️ Страйки: {user['unsubscribe_strikes']}/{settings.unsubscribe_strike_limit}",
+                f"⚠️ Страйки: {user['unsubscribe_strikes']}/{settings.unsubscribe_strike_limit}\n"
+                f"🚫 Предупреждения за не-аниме: {int(user.get('non_anime_warnings') or 0)}/{settings.non_anime_warning_limit}",
                 keyboard=profile_keyboard(),
             )
             return
