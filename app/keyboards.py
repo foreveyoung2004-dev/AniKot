@@ -122,7 +122,7 @@ def shop_packages_keyboard(balance_type: str) -> str:
             rows.append([_text(f"{icon} {p.label.replace(' запросов', '')}") for p in first])
         if rest:
             rows.append([_text(f"{icon} {p.label.replace(' запросов', '')}") for p in rest])
-    rows.append([_text("◀ Назад")])
+    rows.append([_text("◀️ Назад")])
     return _inline(rows)
 
 
