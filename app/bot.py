@@ -71,7 +71,7 @@ def format_result(result: AnimeResult) -> str:
 
 _EMOJI_PREFIXES = (
     "🐾", "✅", "❌", "⚠️", "⛔", "🎁", "🔎", "🔍", "✨", "💎", "👤", "👥",
-    "🛒", "💳", "🎬", "📷", "📸", "🔗", "⚙️", "📊", "💰", "📢", "🛡️",
+    "🛒", "💳", "🎬", "📷", "📸", "🔗", "⚙️", "📊", "💰", "📢", "🛡️", "⏳",
 )
 
 
@@ -717,6 +717,14 @@ def build_bot(settings: Settings, db: Database, detector: AnimeDetector, lava: L
         existing = search_tasks.get(message.from_id)
         if existing and not existing.done():
             await answer(message, "Поиск уже выполняется.", keyboard=search_cancel_keyboard())
+            return
+
+        if len(search_tasks) >= settings.max_pending_searches:
+            await answer(
+                message,
+                "⏳ Сейчас много запросов. Попробуйте ещё раз через несколько секунд — запрос не списан.",
+                keyboard=await user_main_keyboard(message.from_id),
+            )
             return
 
         # For explicit text in Pro+ require age before spending a search credit.
