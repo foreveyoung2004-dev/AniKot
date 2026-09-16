@@ -438,11 +438,67 @@ class Database:
             row = await (await db.execute("SELECT * FROM users WHERE vk_id=?", (vk_id,))).fetchone()
             return dict(row) if row else None
 
-    async def is_account_blocked(self, vk_id: int) -> tuple[bool, int, str | None]:
-        user = await self.get_user(vk_id)
-        if not user:
-            return False, 0, None
-        return bool(user.get("account_blocked")), int(user.get("unsubscribe_strikes") or 0), user.get("blocked_reason")
+    async def is_account_blocked(self, vk_id: int) -> tuple[bool, int, str | None, str | None]:
+        """Return permanent/temporary block status and auto-expire temporary abuse blocks."""
+        async with self._lock:
+            async with self.connection() as db:
+                await db.execute("BEGIN IMMEDIATE")
+                row = await (await db.execute("SELECT * FROM users WHERE vk_id=?", (vk_id,))).fetchone()
+                if not row:
+                    await db.rollback()
+                    return False, 0, None, None
+
+                now = datetime.now(timezone.utc)
+                temporary_until = row["temporary_block_until"]
+                if temporary_until:
+                    try:
+                        until_dt = datetime.fromisoformat(str(temporary_until))
+                        if until_dt.tzinfo is None:
+                            until_dt = until_dt.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        until_dt = now
+
+                    if until_dt <= now:
+                        await db.execute(
+                            "UPDATE users SET temporary_block_until=NULL, temporary_block_reason=NULL, non_anime_warnings=0, updated_at=? WHERE vk_id=?",
+                            (now.isoformat(), vk_id),
+                        )
+                    else:
+                        await db.commit()
+                        return True, int(row["unsubscribe_strikes"] or 0), str(row["temporary_block_reason"] or "temporary"), until_dt.isoformat()
+
+                permanent = bool(row["account_blocked"])
+                reason = row["blocked_reason"]
+                await db.commit()
+                return permanent, int(row["unsubscribe_strikes"] or 0), reason, None
+
+    async def register_non_anime_warning(self, vk_id: int) -> dict[str, Any]:
+        """Add one warning for a clearly non-anime image and block at the configured limit."""
+        async with self._lock:
+            async with self.connection() as db:
+                await db.execute("BEGIN IMMEDIATE")
+                row = await (await db.execute("SELECT non_anime_warnings FROM users WHERE vk_id=?", (vk_id,))).fetchone()
+                if not row:
+                    await db.rollback()
+                    return {"warnings": 0, "blocked": False, "blocked_until": None, "limit": self.settings.non_anime_warning_limit}
+
+                now = datetime.now(timezone.utc)
+                warnings = int(row["non_anime_warnings"] or 0) + 1
+                blocked = warnings >= self.settings.non_anime_warning_limit
+                blocked_until = None
+                if blocked:
+                    blocked_until = (now + timedelta(days=self.settings.non_anime_block_days)).isoformat()
+                    await db.execute(
+                        "UPDATE users SET non_anime_warnings=?, temporary_block_until=?, temporary_block_reason='non_anime_abuse', updated_at=? WHERE vk_id=?",
+                        (warnings, blocked_until, now.isoformat(), vk_id),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE users SET non_anime_warnings=?, updated_at=? WHERE vk_id=?",
+                        (warnings, now.isoformat(), vk_id),
+                    )
+                await db.commit()
+                return {"warnings": warnings, "blocked": blocked, "blocked_until": blocked_until, "limit": self.settings.non_anime_warning_limit}
 
     async def set_pending_package(self, vk_id: int, package_key: str | None) -> None:
         async with self.connection() as db:
