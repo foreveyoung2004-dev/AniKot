@@ -1,0 +1,10 @@
+vkbottle==4.11.0
+fastapi>=0.116,<1
+uvicorn[standard]>=0.35,<1
+httpx>=0.28,<1
+aiosqlite>=0.21,<1
+python-dotenv>=1.1,<2
+numpy>=2.0,<3
+Pillow>=11,<13
+onnxruntime>=1.22,<2
+huggingface-hub>=0.34,<1
