@@ -62,6 +62,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "да"}
 
 
+def _anikot_model() -> str:
+    """Use Qwen3.5 Flash for ordinary AniKot and migrate the old Nano default.
+
+    Existing BotHost deployments may still contain
+    AIAI_ANIKOT_MODEL=gpt-5.4-nano. That value was the previous project
+    default, so it is transparently upgraded to Qwen3.5 Flash. Any other
+    explicit value remains an intentional override.
+    """
+    raw = os.getenv("AIAI_ANIKOT_MODEL", "").strip()
+    if not raw or raw.lower() == "gpt-5.4-nano":
+        return "qwen3.5-flash"
+    return raw
+
+
 def _proplus_model() -> str:
     """Use Kimi K2.6 for Pro+ and transparently migrate the old GPT-5.5 default.
 
@@ -145,10 +159,10 @@ class Settings:
 
     proplus_require_age_confirmation: bool = _env_bool("PROPLUS_REQUIRE_AGE_CONFIRMATION", True)
 
-    # Three vision search tiers through AIAI.BY.
+    # Three search tiers through AIAI.BY.
     aiai_api_key: str = os.getenv("AIAI_API_KEY", "")
     aiai_base_url: str = os.getenv("AIAI_BASE_URL", "https://api.aiai.by/v1")
-    aiai_anikot_model: str = os.getenv("AIAI_ANIKOT_MODEL", "gpt-5.4-nano")
+    aiai_anikot_model: str = _anikot_model()
     aiai_pro_model: str = os.getenv("AIAI_PRO_MODEL", "gpt-5.4-mini")
     aiai_proplus_model: str = _proplus_model()
     aiai_timeout: float = float(os.getenv("AIAI_TIMEOUT", "90"))
