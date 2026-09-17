@@ -16,6 +16,7 @@ from app.db_pool import install_database_pool
 from app.highload import install_highload_guard
 from app.services.aiai import AIAIClient
 from app.services.anime_detector import AnimeDetector
+from app.services.animetrace import AnimeTraceClient
 from app.services.lava import LavaClient
 from app.search_ui import install_search_progress_cleanup
 from app.support import install_support
@@ -89,6 +90,15 @@ async def lifespan(app: FastAPI):
         semaphore=search_ai_gate,
         timeout=settings.aiai_timeout,
     )
+    animetrace = AnimeTraceClient(
+        client=http_client,
+        base_url=settings.animetrace_base_url,
+        enabled=settings.animetrace_enabled,
+        timeout=settings.animetrace_timeout,
+        max_concurrency=settings.animetrace_max_concurrency,
+        min_interval_ms=settings.animetrace_min_interval_ms,
+        preferred_model=settings.animetrace_model,
+    )
     support_ai = SupportAI(
         settings=settings,
         client=http_client,
@@ -99,6 +109,7 @@ async def lifespan(app: FastAPI):
         anikot_ai=anikot_ai,
         pro_ai=pro_ai,
         proplus_ai=proplus_ai,
+        animetrace=animetrace,
     )
     lava = LavaClient(settings, http_client)
     bot = build_bot(settings, db, detector, lava, http_client)
@@ -118,14 +129,15 @@ async def lifespan(app: FastAPI):
     app.state.lava = lava
     app.state.http_client = http_client
     app.state.load_guard = load_guard
+    app.state.animetrace = animetrace
     app.state.runtime_ready = True
 
     bot_task = asyncio.create_task(bot.run_polling(), name="vk-long-polling")
     app.state.bot_task = bot_task
 
     logger.info(
-        "AniKot 2.2.1 runtime started; HTTP=%s:%s search_ai=%s support_ai=%s "
-        "http_pool=%s db_pool=%s max_inflight=%s",
+        "AniKot 2.3.0 runtime started; HTTP=%s:%s search_ai=%s support_ai=%s "
+        "http_pool=%s db_pool=%s max_inflight=%s animetrace=%s trace_concurrency=%s",
         settings.web_host,
         settings.web_port,
         settings.aiai_max_concurrency,
@@ -133,6 +145,8 @@ async def lifespan(app: FastAPI):
         settings.http_max_connections,
         db_pool.size,
         load_guard.max_inflight,
+        settings.animetrace_enabled,
+        settings.animetrace_max_concurrency,
     )
 
     try:
