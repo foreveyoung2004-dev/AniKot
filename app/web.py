@@ -78,7 +78,7 @@ def build_web_app(
 
     @app.get("/")
     async def root():
-        return {"ok": True, "service": "AniKot", "version": "2.3.0-bothost"}
+        return {"ok": True, "service": "AniKot", "version": "2.3.1-bothost"}
 
     @app.get("/health")
     async def health(request: Request):
@@ -106,7 +106,7 @@ def build_web_app(
         return {
             "ok": True,
             "bot": "AniKot",
-            "version": "2.3.0-bothost",
+            "version": "2.3.1-bothost",
             "runtime_ready": bool(getattr(request.app.state, "runtime_ready", False)),
             "ready": bool(getattr(request.app.state, "runtime_ready", False)),
             "ram_mb": _rss_mb(),
