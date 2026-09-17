@@ -96,7 +96,7 @@ async def lifespan(app: FastAPI):
     app.state.bot_task = bot_task
 
     logger.info(
-        "AniKot 2.1.2 runtime started; HTTP=%s:%s ai_concurrency=%s http_pool=%s support_ai=%s",
+        "AniKot 2.1.3 runtime started; HTTP=%s:%s ai_concurrency=%s http_pool=%s support_ai=%s",
         settings.web_host,
         settings.web_port,
         settings.aiai_max_concurrency,
