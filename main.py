@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager, suppress
 
 import httpx
@@ -19,9 +18,6 @@ from app.services.anime_detector import AnimeDetector
 from app.services.animetrace import AnimeTraceClient
 from app.services.lava import LavaClient
 from app.search_ui import install_search_progress_cleanup
-from app.support import install_support
-from app.support_ai import SupportAI
-from app.support_compat import patch_support_rule_registration
 from app.web import build_web_app
 
 logger = logging.getLogger("anikot")
@@ -58,13 +54,8 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(settings.aiai_timeout, connect=15.0),
     )
 
-    # Search traffic has priority capacity. Support AI gets its own gate so a
-    # burst of support conversations cannot consume all recognition slots.
+    # All recognition traffic shares one bounded provider gate.
     search_ai_gate = asyncio.Semaphore(settings.aiai_max_concurrency)
-    support_ai_concurrency = max(
-        1, min(int(os.getenv("SUPPORT_AI_MAX_CONCURRENCY", "1")), 3)
-    )
-    support_ai_gate = asyncio.Semaphore(support_ai_concurrency)
 
     anikot_ai = AIAIClient(
         api_key=settings.aiai_api_key,
@@ -99,11 +90,6 @@ async def lifespan(app: FastAPI):
         min_interval_ms=settings.animetrace_min_interval_ms,
         preferred_model=settings.animetrace_model,
     )
-    support_ai = SupportAI(
-        settings=settings,
-        client=http_client,
-        semaphore=support_ai_gate,
-    )
 
     detector = AnimeDetector(
         anikot_ai=anikot_ai,
@@ -117,11 +103,9 @@ async def lifespan(app: FastAPI):
     load_guard = install_highload_guard(bot, settings)
     install_search_progress_cleanup()
 
-    # vkbottle 4.11 CoroutineRule calls coro functions without Message.
-    # Apply the compatibility correction before support registers its handler.
-    patch_support_rule_registration()
-    await install_support(bot, settings, db, support_ai)
-
+    # Support intentionally lives in a separate bot. Keeping AniKot with one
+    # message router prevents stale support sessions from stealing keyboard
+    # button messages from the main UI.
     app.state.settings = settings
     app.state.db = db
     app.state.db_pool = db_pool
@@ -136,12 +120,11 @@ async def lifespan(app: FastAPI):
     app.state.bot_task = bot_task
 
     logger.info(
-        "AniKot 2.3.0 runtime started; HTTP=%s:%s search_ai=%s support_ai=%s "
+        "AniKot 2.3.1 runtime started; HTTP=%s:%s search_ai=%s "
         "http_pool=%s db_pool=%s max_inflight=%s animetrace=%s trace_concurrency=%s",
         settings.web_host,
         settings.web_port,
         settings.aiai_max_concurrency,
-        support_ai_concurrency,
         settings.http_max_connections,
         db_pool.size,
         load_guard.max_inflight,
