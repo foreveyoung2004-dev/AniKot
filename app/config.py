@@ -62,6 +62,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "да"}
 
 
+def _proplus_model() -> str:
+    """Use Kimi K2.6 for Pro+ and transparently migrate the old GPT-5.5 default.
+
+    Existing BotHost deployments may still have AIAI_PROPLUS_MODEL=gpt-5.5 in
+    their environment. Treat that legacy value as the old project default and
+    move it to Kimi automatically. Any other explicit custom model remains an
+    intentional override.
+    """
+    raw = os.getenv("AIAI_PROPLUS_MODEL", "").strip()
+    if not raw or raw.lower() == "gpt-5.5":
+        return "kimi-k2.6"
+    return raw
+
+
 def _load_packages(currency: str) -> Dict[str, Package]:
     # Product matrix for AniKot 2.0.
     default = {
@@ -131,14 +145,14 @@ class Settings:
 
     proplus_require_age_confirmation: bool = _env_bool("PROPLUS_REQUIRE_AGE_CONFIRMATION", True)
 
-    # Three GPT vision search tiers through AIAI.BY.
+    # Three vision search tiers through AIAI.BY.
     aiai_api_key: str = os.getenv("AIAI_API_KEY", "")
     aiai_base_url: str = os.getenv("AIAI_BASE_URL", "https://api.aiai.by/v1")
     aiai_anikot_model: str = os.getenv("AIAI_ANIKOT_MODEL", "gpt-5.4-nano")
     aiai_pro_model: str = os.getenv("AIAI_PRO_MODEL", "gpt-5.4-mini")
-    aiai_proplus_model: str = os.getenv("AIAI_PROPLUS_MODEL", "gpt-5.5")
+    aiai_proplus_model: str = _proplus_model()
     aiai_timeout: float = float(os.getenv("AIAI_TIMEOUT", "90"))
-    # Global cap for all AI tiers together. Values above 3 are clamped in low-memory 2.0.
+    # Global cap for all search AI tiers together.
     aiai_max_concurrency: int = max(1, min(int(os.getenv("AIAI_MAX_CONCURRENCY", "3")), 3))
 
     # Low-memory transport/image settings.
