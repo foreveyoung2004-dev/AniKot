@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import hmac
+import html
 import logging
-from pathlib import Path
+import re
 from contextlib import AbstractAsyncContextManager
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs
-import html
-import re
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -72,32 +72,35 @@ button{{width:100%;border:0;border-radius:13px;padding:14px 16px;margin-top:14px
 def build_web_app(
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager] | None = None,
 ) -> FastAPI:
-    """Create the public FastAPI application.
-
-    Runtime services are attached to ``app.state`` by main.py during lifespan
-    startup. Keeping the FastAPI object at module/main scope makes the project
-    unambiguously detectable as a web application by hosting platforms such as
-    BotHost, avoiding a second automatic HTTP wrapper on the same PORT.
-    """
+    """Create the public FastAPI application."""
 
     app = FastAPI(title="AniKot webhooks", docs_url=None, redoc_url=None, lifespan=lifespan)
 
     @app.get("/")
     async def root():
-        return {"ok": True, "service": "AniKot", "version": "2.1.3-bothost"}
+        return {"ok": True, "service": "AniKot", "version": "2.2.0-bothost"}
 
     @app.get("/health")
     async def health(request: Request):
         bot = getattr(request.app.state, "bot", None)
         active = len(getattr(bot, "_anikot_search_tasks", {})) if bot is not None else 0
+
+        guard = getattr(request.app.state, "load_guard", None)
+        guard_metrics = guard.snapshot() if guard is not None else {}
+
+        db_pool = getattr(request.app.state, "db_pool", None)
+        db_metrics = db_pool.snapshot() if db_pool is not None else {}
+
         return {
             "ok": True,
             "bot": "AniKot",
-            "version": "2.1.3-bothost",
+            "version": "2.2.0-bothost",
             "runtime_ready": bool(getattr(request.app.state, "runtime_ready", False)),
             "ready": bool(getattr(request.app.state, "runtime_ready", False)),
             "ram_mb": _rss_mb(),
             "active_searches": active,
+            "load": guard_metrics,
+            "database_pool": db_metrics,
         }
 
     @app.get("/checkout/{token}", response_class=HTMLResponse)
@@ -130,7 +133,14 @@ def build_web_app(
         email = ((form.get("email") or [""])[0]).strip()
         package = PACKAGES[str(session["package_key"])]
         if not EMAIL_RE.match(email):
-            return HTMLResponse(_checkout_page(package.label, f"/checkout/{token}", "Проверьте email и попробуйте ещё раз."), status_code=400)
+            return HTMLResponse(
+                _checkout_page(
+                    package.label,
+                    f"/checkout/{token}",
+                    "Проверьте email и попробуйте ещё раз.",
+                ),
+                status_code=400,
+            )
 
         local_id = await db.create_payment(int(session["vk_id"]), package, email)
         try:
@@ -141,7 +151,14 @@ def build_web_app(
         except Exception as exc:
             logger.exception("Payment checkout creation failed")
             await db.fail_payment_creation(local_id, str(exc))
-            return HTMLResponse(_checkout_page(package.label, f"/checkout/{token}", "Не удалось продолжить оплату. Попробуйте позже."), status_code=503)
+            return HTMLResponse(
+                _checkout_page(
+                    package.label,
+                    f"/checkout/{token}",
+                    "Не удалось продолжить оплату. Попробуйте позже.",
+                ),
+                status_code=503,
+            )
 
     @app.post("/lava/webhook")
     async def lava_webhook(
@@ -176,12 +193,16 @@ def build_web_app(
         if was_new:
             try:
                 user = await db.get_user(vk_id)
-                keyboard = main_keyboard(show_subscription_bonus=not bool((user or {}).get("subscription_bonus_claimed")))
+                keyboard = main_keyboard(
+                    show_subscription_bonus=not bool((user or {}).get("subscription_bonus_claimed"))
+                )
                 await bot.api.messages.send(
                     peer_id=vk_id,
                     random_id=0,
-                    message=(f"✅ Оплата получена.\n"
-                             f"Начислено: +{requests_count} {_label(btype)}."),
+                    message=(
+                        f"✅ Оплата получена.\n"
+                        f"Начислено: +{requests_count} {_label(btype)}."
+                    ),
                     keyboard=keyboard,
                 )
             except Exception:
