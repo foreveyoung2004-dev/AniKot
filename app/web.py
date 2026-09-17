@@ -78,7 +78,7 @@ def build_web_app(
 
     @app.get("/")
     async def root():
-        return {"ok": True, "service": "AniKot", "version": "2.2.1-bothost"}
+        return {"ok": True, "service": "AniKot", "version": "2.3.0-bothost"}
 
     @app.get("/health")
     async def health(request: Request):
@@ -91,14 +91,28 @@ def build_web_app(
         db_pool = getattr(request.app.state, "db_pool", None)
         db_metrics = db_pool.snapshot() if db_pool is not None else {}
 
+        animetrace = getattr(request.app.state, "animetrace", None)
+        animetrace_metrics = animetrace.snapshot() if animetrace is not None else {}
+
+        settings = getattr(request.app.state, "settings", None)
+        search_models = {}
+        if settings is not None:
+            search_models = {
+                "anikot": settings.aiai_anikot_model,
+                "pro_verifier": settings.aiai_pro_model,
+                "proplus_vision": settings.aiai_proplus_model,
+            }
+
         return {
             "ok": True,
             "bot": "AniKot",
-            "version": "2.2.1-bothost",
+            "version": "2.3.0-bothost",
             "runtime_ready": bool(getattr(request.app.state, "runtime_ready", False)),
             "ready": bool(getattr(request.app.state, "runtime_ready", False)),
             "ram_mb": _rss_mb(),
             "active_searches": active,
+            "search_models": search_models,
+            "animetrace": animetrace_metrics,
             "load": guard_metrics,
             "database_pool": db_metrics,
         }
