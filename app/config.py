@@ -63,27 +63,28 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _anikot_model() -> str:
-    """Use Qwen3.5 Flash for ordinary AniKot and migrate the old Nano default.
-
-    Existing BotHost deployments may still contain
-    AIAI_ANIKOT_MODEL=gpt-5.4-nano. That value was the previous project
-    default, so it is transparently upgraded to Qwen3.5 Flash. Any other
-    explicit value remains an intentional override.
-    """
+    """Use Qwen3.5 Flash for ordinary AniKot and migrate the old Nano default."""
     raw = os.getenv("AIAI_ANIKOT_MODEL", "").strip()
     if not raw or raw.lower() == "gpt-5.4-nano":
         return "qwen3.5-flash"
     return raw
 
 
-def _proplus_model() -> str:
-    """Use Kimi K2.6 for Pro+ and transparently migrate the old GPT-5.5 default.
+def _pro_model() -> str:
+    """Use DeepSeek V4 Flash for Pro verification and migrate GPT-5.4 Mini.
 
-    Existing BotHost deployments may still have AIAI_PROPLUS_MODEL=gpt-5.5 in
-    their environment. Treat that legacy value as the old project default and
-    move it to Kimi automatically. Any other explicit custom model remains an
-    intentional override.
+    AIAI.BY currently lists the model as DeepSeek V4 Flash. A custom explicit
+    AIAI_PRO_MODEL is preserved so a future V4.1 model can be selected without
+    a code change when it appears in the provider model list.
     """
+    raw = os.getenv("AIAI_PRO_MODEL", "").strip()
+    if not raw or raw.lower() == "gpt-5.4-mini":
+        return "deepseek-v4-flash"
+    return raw
+
+
+def _proplus_model() -> str:
+    """Use Kimi K2.6 for Pro+ and transparently migrate the old GPT-5.5 default."""
     raw = os.getenv("AIAI_PROPLUS_MODEL", "").strip()
     if not raw or raw.lower() == "gpt-5.5":
         return "kimi-k2.6"
@@ -129,7 +130,6 @@ class Settings:
     admin_ids: set[int] = frozenset(_parse_admin_ids(os.getenv("ADMIN_IDS", "")))
 
     # Registration / bonuses.
-    # New users receive regular AniKot searches; referrals reward Pro searches.
     registration_bonus_requests: int = int(os.getenv("REGISTRATION_BONUS_REQUESTS", "1"))
     subscription_bonus_requests: int = int(os.getenv("SUBSCRIPTION_BONUS_REQUESTS", "2"))
     referral_reward_pro: int = int(os.getenv("REFERRAL_REWARD_PRO", "3"))
@@ -159,15 +159,28 @@ class Settings:
 
     proplus_require_age_confirmation: bool = _env_bool("PROPLUS_REQUIRE_AGE_CONFIRMATION", True)
 
-    # Three search tiers through AIAI.BY.
+    # AIAI.BY models used by the three search tiers.
     aiai_api_key: str = os.getenv("AIAI_API_KEY", "")
     aiai_base_url: str = os.getenv("AIAI_BASE_URL", "https://api.aiai.by/v1")
     aiai_anikot_model: str = _anikot_model()
-    aiai_pro_model: str = os.getenv("AIAI_PRO_MODEL", "gpt-5.4-mini")
+    aiai_pro_model: str = _pro_model()
     aiai_proplus_model: str = _proplus_model()
     aiai_timeout: float = float(os.getenv("AIAI_TIMEOUT", "90"))
-    # Global cap for all search AI tiers together.
     aiai_max_concurrency: int = max(1, min(int(os.getenv("AIAI_MAX_CONCURRENCY", "3")), 3))
+
+    # AnimeTrace is used only by paid image tiers. Its public API has no user
+    # key, so the client deliberately spaces requests and trips a circuit
+    # breaker on overload/usage-limit responses.
+    animetrace_enabled: bool = _env_bool("ANIMETRACE_ENABLED", True)
+    animetrace_base_url: str = os.getenv("ANIMETRACE_BASE_URL", "https://api.animetrace.com")
+    animetrace_model: str = os.getenv("ANIMETRACE_MODEL", "").strip()
+    animetrace_timeout: float = float(os.getenv("ANIMETRACE_TIMEOUT", "15"))
+    animetrace_max_concurrency: int = max(
+        1, min(int(os.getenv("ANIMETRACE_MAX_CONCURRENCY", "2")), 4)
+    )
+    animetrace_min_interval_ms: int = max(
+        0, int(os.getenv("ANIMETRACE_MIN_INTERVAL_MS", "500"))
+    )
 
     # Low-memory transport/image settings.
     vk_image_max_side: int = int(os.getenv("VK_IMAGE_MAX_SIDE", "1280"))
@@ -180,7 +193,7 @@ class Settings:
     max_pending_searches: int = int(os.getenv("MAX_PENDING_SEARCHES", "30"))
     vision_cache_ttl_days: int = int(os.getenv("VISION_CACHE_TTL_DAYS", "30"))
 
-    # Confidence gates. The model's confidence is a heuristic, not a statistical guarantee.
+    # Confidence gates. Model confidence is a heuristic, not a statistical guarantee.
     anikot_min_confidence: float = float(os.getenv("ANIKOT_MIN_CONFIDENCE", "0.55"))
     pro_min_confidence: float = float(os.getenv("PRO_MIN_CONFIDENCE", "0.65"))
     proplus_min_confidence: float = float(os.getenv("PROPLUS_MIN_CONFIDENCE", "0.75"))
@@ -231,6 +244,8 @@ class Settings:
             raise RuntimeError("MAX_PENDING_SEARCHES должен быть >= AIAI_MAX_CONCURRENCY")
         if self.vision_cache_ttl_days < 1:
             raise RuntimeError("VISION_CACHE_TTL_DAYS должен быть >= 1")
+        if self.animetrace_timeout < 3:
+            raise RuntimeError("ANIMETRACE_TIMEOUT должен быть >= 3")
         for name, value in (
             ("ANIKOT_MIN_CONFIDENCE", self.anikot_min_confidence),
             ("PRO_MIN_CONFIDENCE", self.pro_min_confidence),
