@@ -15,6 +15,9 @@ class AnimeResult:
     episodes: int | None
     confidence: float | None
     engine: str
+    # Required cache-generation marker. Old v2 cached objects do not contain
+    # this field and are therefore ignored/recomputed by bot.py.
+    analysis_version: str
     adult_content: bool = False
     minor_risk: bool = False
     usage: dict[str, Any] | None = None
@@ -24,7 +27,7 @@ class AnimeResult:
 
 
 class AnimeDetector:
-    """AniKot search engine using only the selected remote model for each tier."""
+    """AniKot search engine using the selected remote model for each tier."""
 
     def __init__(
         self,
@@ -66,15 +69,20 @@ class AnimeDetector:
         return "Япония"
 
     def _from_remote(self, remote: dict[str, Any]) -> AnimeResult | None:
-        # Prefer Russian-facing fields. Old cache/provider responses remain compatible via fallbacks.
+        # Prefer Russian-facing fields. Provider responses remain compatible via fallbacks.
         title = str(
             remote.get("title_ru")
             or remote.get("title")
             or remote.get("title_original")
             or ""
         ).strip()
+        is_anime = bool(remote.get("is_anime", True))
         if not title:
-            return None
+            if is_anime:
+                return None
+            # Preserve a confident non-anime classification so bot.py can apply
+            # the warning/block policy without trying to render a search result.
+            title = "Не аниме"
 
         character_raw = (
             remote.get("character_ru")
@@ -89,7 +97,7 @@ class AnimeDetector:
         raw_alternatives = remote.get("alternatives")
         if isinstance(raw_alternatives, list):
             seen = {title.casefold()}
-            for item in raw_alternatives[:2]:
+            for item in raw_alternatives[:4]:
                 if not isinstance(item, dict):
                     continue
                 alt_title = str(
@@ -107,6 +115,12 @@ class AnimeDetector:
                         "confidence": self._confidence(item.get("confidence")),
                     }
                 )
+                if len(alternatives) >= 2:
+                    break
+
+        model = str(remote.get("_model") or "AI")
+        if remote.get("_verified"):
+            model = f"{model} + verifier"
 
         return AnimeResult(
             title=title,
@@ -115,12 +129,15 @@ class AnimeDetector:
             year=self._integer(remote.get("year")),
             episodes=self._integer(remote.get("episodes")),
             confidence=self._confidence(remote.get("confidence")),
-            engine=str(remote.get("_model") or "AI"),
+            engine=model,
+            analysis_version=str(
+                remote.get("_accuracy_revision") or AIAIClient.ACCURACY_REVISION
+            ),
             adult_content=bool(remote.get("adult_content", False)),
             minor_risk=bool(remote.get("minor_risk", False)),
             usage=remote.get("_usage") if isinstance(remote.get("_usage"), dict) else None,
             alternatives=alternatives,
-            is_anime=bool(remote.get("is_anime", True)),
+            is_anime=is_anime,
             anime_likelihood=self._confidence(remote.get("anime_likelihood")),
         )
 
