@@ -56,7 +56,7 @@ def search_mode_keyboard() -> str:
 
 
 def search_cancel_keyboard() -> str:
-    return _inline([[_text("🛑 Отмена")]])
+    return _inline([[_text("Отмена")]])
 
 
 def result_keyboard() -> str:
