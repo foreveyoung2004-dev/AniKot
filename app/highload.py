@@ -59,6 +59,23 @@ class HighLoadGuard:
         now = time.monotonic()
         async with self._lock:
             self.total += 1
+            if self.total % 1000 == 0:
+                self._prune_users(now)
+
+            # Shed global overload before allocating per-user tracking state.
+            # This keeps a burst of many one-off users from growing the dicts.
+            if self.active >= self.max_inflight:
+                self.rejected_overload += 1
+                one_second_ago = now - 1.0
+                while self._global_warning_times and self._global_warning_times[0] < one_second_ago:
+                    self._global_warning_times.popleft()
+                notify = (
+                    self.global_warning_per_second > 0
+                    and len(self._global_warning_times) < self.global_warning_per_second
+                )
+                if notify:
+                    self._global_warning_times.append(now)
+                return False, notify, "overload"
 
             events = self._events.setdefault(vk_id, deque())
             cutoff = now - self.window_seconds
@@ -73,26 +90,9 @@ class HighLoadGuard:
                     self._last_user_warning[vk_id] = now
                 return False, notify, "rate_limit"
 
-            if self.active >= self.max_inflight:
-                self.rejected_overload += 1
-                one_second_ago = now - 1.0
-                while self._global_warning_times and self._global_warning_times[0] < one_second_ago:
-                    self._global_warning_times.popleft()
-                notify = (
-                    self.global_warning_per_second > 0
-                    and len(self._global_warning_times) < self.global_warning_per_second
-                )
-                if notify:
-                    self._global_warning_times.append(now)
-                return False, notify, "overload"
-
             events.append(now)
             self.active += 1
             self.peak_active = max(self.peak_active, self.active)
-
-            if self.total % 1000 == 0:
-                self._prune_users(now)
-
             return True, False, "ok"
 
     async def release(self) -> None:
