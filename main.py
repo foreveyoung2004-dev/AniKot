@@ -16,6 +16,7 @@ from app.services.anime_detector import AnimeDetector
 from app.services.lava import LavaClient
 from app.search_ui import install_search_progress_cleanup
 from app.support import install_support
+from app.support_ai import SupportAI
 from app.web import build_web_app
 
 logger = logging.getLogger("anikot")
@@ -76,11 +77,13 @@ async def lifespan(app: FastAPI):
         semaphore=ai_gate,
         timeout=settings.aiai_timeout,
     )
+    support_ai = SupportAI(settings=settings, client=http_client, semaphore=ai_gate)
+
     detector = AnimeDetector(anikot_ai=anikot_ai, pro_ai=pro_ai, proplus_ai=proplus_ai)
     lava = LavaClient(settings, http_client)
     bot = build_bot(settings, db, detector, lava, http_client)
     install_search_progress_cleanup()
-    await install_support(bot, settings, db)
+    await install_support(bot, settings, db, support_ai)
 
     app.state.settings = settings
     app.state.db = db
@@ -93,11 +96,12 @@ async def lifespan(app: FastAPI):
     app.state.bot_task = bot_task
 
     logger.info(
-        "AniKot 2.1.2 runtime started; HTTP=%s:%s ai_concurrency=%s http_pool=%s",
+        "AniKot 2.1.2 runtime started; HTTP=%s:%s ai_concurrency=%s http_pool=%s support_ai=%s",
         settings.web_host,
         settings.web_port,
         settings.aiai_max_concurrency,
         settings.http_max_connections,
+        support_ai.preferred_model,
     )
 
     try:
